@@ -1,12 +1,5 @@
-from needle.autograd import Tensor
-import needle.backend_ndarray.ndarray as ndarray
 from needle import ops
-from .nn_basic import (
-    Parameter,
-    Module,
-    LayerNorm1d,
-    Linear
-)
+from .nn_basic import Module
 
 class FlashMutiHeadAttention(Module):
 
@@ -18,7 +11,8 @@ class FlashMutiHeadAttention(Module):
         device = None,
         dtype = "float32",
     ):
-        if device is not "cuda" :
+        device_name = getattr(device, "name", device)
+        if device_name != "cuda":
             raise ValueError("flash attention only supports cuda")
         super().__init__()
 
@@ -37,6 +31,4 @@ class FlashMutiHeadAttention(Module):
 
         assert q_dim == k_dim == v_dim
 
-
-        result = ops.flashattention(q, k, v, dropout=self.dropout, causal=self.causal)
-        return result 
+        return ops.flashattention(q, k, v, dropout=self.dropout, causal=self.causal)

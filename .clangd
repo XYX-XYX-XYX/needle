@@ -1,0 +1,23 @@
+CompileFlags:
+  CompilationDatabase: build
+
+---
+If:
+  PathMatch: .*\.cu
+CompileFlags:
+  Add:
+    - -std=c++14
+    - -nocudainc
+    - --cuda-path=/usr/local/cuda
+    - --cuda-gpu-arch=sm_80
+    - --cuda-host-only
+    - --no-cuda-version-check
+    - -ferror-limit=0
+Diagnostics:
+  Suppress:
+    - redefinition
+    - undeclared_var_use
+    - undeclared_var_use_suggest
+    - fatal_too_many_errors
+    - ref_bad_target
+    - unused-includes

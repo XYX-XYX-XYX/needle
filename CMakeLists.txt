@@ -3,6 +3,9 @@ project(needle C CXX)
 cmake_policy(SET CMP0146 OLD)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
+option(NEEDLE_USE_FLASHATTN_STUB "Build FlashAttention stub hooks into the CUDA backend" ON)
+set(NEEDLE_CUTLASS_PATH "${CMAKE_CURRENT_SOURCE_DIR}/3rdparty/cutlass" CACHE PATH "Path to the CUTLASS checkout")
+
 # find correct version of Python
 execute_process(COMMAND python3-config --prefix
   OUTPUT_VARIABLE Python_ROOT_DIR)
@@ -61,6 +64,16 @@ if(CUDA_FOUND)
   include_directories(SYSTEM ${CUDA_INCLUDE_DIRS})
   list(APPEND LINKER_LIBS ${CUDA_CUDART_LIBRARY})
 
+  set(NEEDLE_ENABLE_FLASHATTN_STUB OFF)
+  if(NEEDLE_USE_FLASHATTN_STUB)
+    if(EXISTS "${NEEDLE_CUTLASS_PATH}/include/cutlass/cutlass.h")
+      set(NEEDLE_ENABLE_FLASHATTN_STUB ON)
+      message(STATUS "Building CUDA backend with FlashAttention stub support")
+    else()
+      message(WARNING "FlashAttention stub requested but CUTLASS was not found at ${NEEDLE_CUTLASS_PATH}; building CUDA backend without flash stub support")
+    endif()
+  endif()
+
   # invoke nvidia smi to detect if we really have a GPU
   execute_process(COMMAND "nvidia-smi" ERROR_QUIET  RESULT_VARIABLE NV_RET)
   if(NV_RET EQUAL "0")
@@ -72,6 +85,13 @@ if(CUDA_FOUND)
 
   # set arch flags properly
   CUDA_ADD_LIBRARY(ndarray_backend_cuda MODULE src/ndarray_backend_cuda.cu OPTIONS ${ARCH_FLAGS})
+
+  if(NEEDLE_ENABLE_FLASHATTN_STUB)
+    target_compile_definitions(ndarray_backend_cuda PRIVATE NEEDLE_ENABLE_FLASHATTN_STUB=1)
+    target_include_directories(ndarray_backend_cuda SYSTEM PRIVATE
+      ${NEEDLE_CUTLASS_PATH}/include
+    )
+  endif()
 
   target_link_libraries(ndarray_backend_cuda ${LINKER_LIBS})
   pybind11_extension(ndarray_backend_cuda)
@@ -86,4 +106,3 @@ if(CUDA_FOUND)
 )
 
 endif()
-
