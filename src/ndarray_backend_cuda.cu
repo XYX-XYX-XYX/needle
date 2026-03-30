@@ -640,21 +640,19 @@ void ReduceSum(const CudaArray& a, CudaArray* out, size_t reduce_size) {
 
 #ifdef NEEDLE_ENABLE_FLASHATTN_STUB
 void FlashAttentionForward(const CudaArray& q, const CudaArray& k, const CudaArray& v,
-                          CudaArray* out, CudaArray* probs, size_t batch_size,
-                          size_t num_heads, size_t q_len, size_t kv_len,
+                          CudaArray* out, size_t batch_size, size_t num_heads,
+                          size_t q_len, size_t kv_len,
                           size_t head_dim, scalar_t dropout, bool causal) {
   (void)sizeof(cutlass::Status);
 
   const size_t q_size = batch_size * num_heads * q_len * head_dim;
   const size_t kv_size = batch_size * num_heads * kv_len * head_dim;
   const size_t out_size = q_size;
-  const size_t probs_size = batch_size * num_heads * q_len * kv_len;
 
   if (q.size != q_size) throw std::runtime_error("flash attention q tensor size does not match the provided metadata");
   if (k.size != kv_size) throw std::runtime_error("flash attention k tensor size does not match the provided metadata");
   if (v.size != kv_size) throw std::runtime_error("flash attention v tensor size does not match the provided metadata");
   if (out->size != out_size) throw std::runtime_error("flash attention output tensor size does not match the provided metadata");
-  if (probs->size != probs_size) throw std::runtime_error("flash attention probs tensor size does not match the provided metadata");
 
   std::ostringstream msg;
   msg << "flash attention kernel registered but not implemented"

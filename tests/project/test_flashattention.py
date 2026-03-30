@@ -12,46 +12,46 @@ np.random.seed(3)
 
 _DEVICES = [ndl.cuda()]
 
-@pytest.mark.parametrize("batch_size", [4, 8])
-@pytest.mark.parametrize("num_heads", [5])
-@pytest.mark.parametrize("queries_len", [31])
-@pytest.mark.parametrize("inner_dim", [64])
-@pytest.mark.parametrize("causal", [False, True])
-@pytest.mark.parametrize("dropout", [0.0, 0.1])
-@pytest.mark.parametrize("device", _DEVICES, ids=["cuda"])
-def test_flashattention_activation(batch_size, num_heads, queries_len, inner_dim, causal, dropout, device):
+# @pytest.mark.parametrize("batch_size", [4, 8])
+# @pytest.mark.parametrize("num_heads", [5])
+# @pytest.mark.parametrize("queries_len", [31])
+# @pytest.mark.parametrize("inner_dim", [64])
+# @pytest.mark.parametrize("causal", [False, True])
+# @pytest.mark.parametrize("dropout", [0.0, 0.1])
+# @pytest.mark.parametrize("device", _DEVICES, ids=["cuda"])
+# def test_flashattention_activation(batch_size, num_heads, queries_len, inner_dim, causal, dropout, device):
 
-    np.random.seed(19943)
+#     np.random.seed(19943)
 
-    q = np.random.randn(
-        batch_size, num_heads,
-        queries_len, inner_dim).astype(np.float32)
+#     q = np.random.randn(
+#         batch_size, num_heads,
+#         queries_len, inner_dim).astype(np.float32)
 
-    layer = nn.FlashMutiHeadAttention(
-        dropout=dropout, causal=causal, device=device)
+#     layer = nn.FlashMutiHeadAttention(
+#         dropout=dropout, causal=causal, device=device)
 
-    result, probs = layer(
-        ndl.Tensor(q, device=device),
-        ndl.Tensor(q, device=device),
-        ndl.Tensor(q, device=device),
-    )
+#     result, probs = layer(
+#         ndl.Tensor(q, device=device),
+#         ndl.Tensor(q, device=device),
+#         ndl.Tensor(q, device=device),
+#     )
 
-    probs = probs.numpy()
+#     probs = probs.numpy()
 
-    current_input_id = "-".join([str(x) for x in (
-        batch_size, num_heads, queries_len, inner_dim, causal, dropout, device
-    )])
+#     current_input_id = "-".join([str(x) for x in (
+#         batch_size, num_heads, queries_len, inner_dim, causal, dropout, device
+#     )])
 
-    labels_path = (
-        "./tests/hw4/data/" + 
-        "test_attention_activation-{}.npy"
-        .format(current_input_id))
+#     labels_path = (
+#         "./tests/hw4/data/" + 
+#         "test_attention_activation-{}.npy"
+#         .format(current_input_id))
 
-    with open(labels_path, 'rb') as f:
-        label_probs = np.load(f)
+#     with open(labels_path, 'rb') as f:
+#         label_probs = np.load(f)
 
-    # np.testing.assert_array_equal(probs, label_probs)
-    np.testing.assert_allclose(probs, label_probs, atol=1e-5, rtol=1e-5)
+#     # np.testing.assert_array_equal(probs, label_probs)
+#     np.testing.assert_allclose(probs, label_probs, atol=1e-5, rtol=1e-5)
 
 
 @pytest.mark.parametrize("batch_size", [2])

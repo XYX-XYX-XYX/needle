@@ -760,6 +760,57 @@ def sum(a: NDArray, axis: int | tuple[int] | list[int] | None = None, keepdims: 
 def flip(a: NDArray, axes: tuple[int, ...]) -> NDArray:
     return a.flip(axes)
 
+
+def flash_attention(q: NDArray, k: NDArray, v: NDArray, dropout: float, causal: bool) -> NDArray:
+    if q.device != k.device or q.device != v.device:
+        raise ValueError("FlashAttention expects q, k, and v to live on the same device")
+
+    if getattr(q.device, "name", None) != "cuda":
+        raise RuntimeError("FlashAttention only supports the CUDA backend")
+
+    if len(q.shape) != 4 or len(k.shape) != 4 or len(v.shape) != 4:
+        raise ValueError("FlashAttention expects q, k, and v with shape (batch_size, num_heads, seq_len, head_dim)")
+
+    batch_size, num_heads, q_len, q_dim = q.shape
+    k_batch_size, k_num_heads, kv_len, k_dim = k.shape
+    v_batch_size, v_num_heads, v_len, v_dim = v.shape
+
+    if batch_size != k_batch_size or batch_size != v_batch_size:
+        raise ValueError("FlashAttention expects q, k, and v to share the same batch size")
+    if num_heads != k_num_heads or num_heads != v_num_heads:
+        raise ValueError("FlashAttention expects q, k, and v to share the same number of heads")
+    if kv_len != v_len:
+        raise ValueError("FlashAttention expects k and v to share the same sequence length")
+    if q_dim != k_dim or q_dim != v_dim:
+        raise ValueError("FlashAttention expects q, k, and v to share the same head dimension")
+
+    if not getattr(q.device, "__has_flash_attention_stub__", False) or not hasattr(q.device, "flash_attention_forward"):
+        raise RuntimeError(
+            "FlashAttention backend hook is not registered; rebuild the CUDA backend with NEEDLE_USE_FLASHATTN_STUB=ON and CUTLASS available"
+        )
+
+    q = q.compact()
+    k = k.compact()
+    v = v.compact()
+
+    result = empty(q.shape, device=q.device)
+
+    q.device.flash_attention_forward(
+        q._handle,
+        k._handle,
+        v._handle,
+        result._handle,
+        batch_size,
+        num_heads,
+        q_len,
+        kv_len,
+        q_dim,
+        dropout,
+        causal,
+    )
+    return result
+
+
 def stack(args, axis=0):
     """
     args: list of NDArray

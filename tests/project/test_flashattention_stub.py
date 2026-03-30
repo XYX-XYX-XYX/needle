@@ -6,6 +6,7 @@ import numpy as np
 import pytest
 
 import needle as ndl
+from needle.backend_ndarray import ndarray as ndarray_api
 import needle.nn as nn
 
 
@@ -27,18 +28,82 @@ def test_flashattention_backend_hook_registered(device):
     assert hasattr(device, "flash_attention_forward")
 
 
+def _tensor_or_skip(array, device):
+    try:
+        return ndl.Tensor(array, device=device)
+    except RuntimeError as err:
+        if "CUDA driver version is insufficient for CUDA runtime version" in str(err):
+            pytest.skip("CUDA runtime allocation is unavailable in this environment")
+        raise
+
+
 @pytest.mark.parametrize("causal", [False, True])
 @pytest.mark.parametrize("dropout", [0.0, 0.1])
 @pytest.mark.parametrize("device", [CUDA_DEVICE])
-def test_flashattention_stub_raises_clear_error(causal, dropout, device):
+def test_flashattention_module_hits_cuda_stub(causal, dropout, device):
     np.random.seed(19943)
     q = np.random.randn(2, 4, 8, 16).astype(np.float32)
 
     layer = nn.FlashMutiHeadAttention(dropout=dropout, causal=causal, device=device)
+    q_tensor = _tensor_or_skip(q, device)
+    k_tensor = _tensor_or_skip(q, device)
+    v_tensor = _tensor_or_skip(q, device)
+
+    expected = (
+        "flash attention kernel registered but not implemented "
+        f"(batch_size=2, num_heads=4, q_len=8, kv_len=8, head_dim=16, dropout={dropout}, causal={str(causal).lower()})"
+    )
+    escaped = expected.replace("(", r"\(").replace(")", r"\)")
+
+    with pytest.raises(RuntimeError, match=escaped):
+        layer(q_tensor, k_tensor, v_tensor)
+
+
+class _FakeHandle:
+    pass
+
+
+class _FakeArray:
+    def __init__(self, shape, device):
+        self.shape = shape
+        self.device = device
+        self._handle = _FakeHandle()
+
+    def compact(self):
+        return self
+
+
+class _FakeCudaDevice:
+    name = "cuda"
+    __has_flash_attention_stub__ = True
+
+    def __init__(self):
+        self.calls = []
+
+    def empty(self, shape, dtype="float32"):
+        assert dtype == "float32"
+        return _FakeArray(shape, self)
+
+    def flash_attention_forward(self, *args):
+        self.calls.append(args)
+        raise RuntimeError("flash attention kernel registered but not implemented")
+
+
+@pytest.mark.parametrize("causal", [False, True])
+@pytest.mark.parametrize("dropout", [0.0, 0.1])
+def test_flashattention_stub_calls_cuda_hook(causal, dropout):
+    device = _FakeCudaDevice()
+    q = _FakeArray((2, 4, 8, 16), device)
+    k = _FakeArray((2, 4, 8, 16), device)
+    v = _FakeArray((2, 4, 8, 16), device)
 
     with pytest.raises(RuntimeError, match="registered but not implemented"):
-        layer(
-            ndl.Tensor(q, device=device),
-            ndl.Tensor(q, device=device),
-            ndl.Tensor(q, device=device),
-        )
+        ndarray_api.flash_attention(q, k, v, dropout, causal)
+
+    assert len(device.calls) == 1
+    hook_args = device.calls[0]
+    assert hook_args[0] is q._handle
+    assert hook_args[1] is k._handle
+    assert hook_args[2] is v._handle
+    assert hook_args[3] is not None
+    assert hook_args[4:] == (2, 4, 8, 8, 16, dropout, causal)
