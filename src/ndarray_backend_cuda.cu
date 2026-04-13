@@ -9,6 +9,9 @@
 
 #ifdef NEEDLE_ENABLE_FLASHATTN_STUB
 #include <cutlass/cutlass.h>
+#include <cute/tensor.hpp>
+#include <cutlass/numeric_types.h>
+#include <cutlass/numeric_conversion.h>
 #endif
 
 namespace needle {
@@ -639,6 +642,222 @@ void ReduceSum(const CudaArray& a, CudaArray* out, size_t reduce_size) {
 }
 
 #ifdef NEEDLE_ENABLE_FLASHATTN_STUB
+
+template <typename GLayoutQ, typename GLayoutK, typename GLayoutV, typename GLayoutO,
+          typename SLayoutQ, typename SLayoutK, typename SLayoutV, typename SLayoutO,
+          typename TileG2SQ, typename TileG2SK, typename TileG2SV,
+          typename MMA1, typename MMA2>
+__global__ void flash_attention_kernel(const scalar_t* q, const scalar_t* k, const scalar_t* v,
+                                       scalar_t* o, scalar_t dropout, bool causal,
+                                       GLayoutQ gQL, GLayoutK gKL, GLayoutV gVL, GLayoutO gOL,
+                                       SLayoutQ sQL, SLayoutK sKL, SLayoutV sVL, SLayoutO sOL,
+                                       TileG2SQ g2s_copyQ, TileG2SK g2s_copyK, TileG2SV g2s_copyV,
+                                       MMA1 mma1, MMA2 mma2)
+{
+  using namespace cute;
+
+  extern __shared__ scalar_t smem[];
+  cutlass::NumericConverter<cutlass::tfloat32_t, float> to_tf32;
+
+  scalar_t* qShmem = smem;
+  scalar_t* kShmem = qShmem + size(sQL);
+  scalar_t* vShmem = kShmem + size(sKL);
+  scalar_t* oShmem = vShmem + size(sVL);
+  scalar_t* pShmem = oShmem + size(sOL);
+  scalar_t* row_maxShmem = pShmem + size<0>(sQL) * size<0>(sKL);
+  scalar_t* row_sumShmem = row_maxShmem + size<0>(sQL);
+
+  for (int i = threadIdx.x; i < size(sOL); i += blockDim.x) {
+    oShmem[i] = 0.0f;
+  }
+  __syncthreads();
+
+  Tensor Q = make_tensor(make_gmem_ptr<scalar_t>(q), gQL);   // (batch_size, num_heads, q_len, head_dim)
+  Tensor K = make_tensor(make_gmem_ptr<scalar_t>(k), gKL);   // (batch_size, num_heads, kv_len, head_dim)
+  Tensor V = make_tensor(make_gmem_ptr<scalar_t>(v), gVL);   // (batch_size, num_heads, kv_len, head_dim)
+  Tensor O = make_tensor(make_gmem_ptr<scalar_t>(o), gOL);   // (batch_size, num_heads, q_len, head_dim)
+
+  int bid = blockIdx.x;
+  int num_tiles = size<2>(gQL) / size<0>(sQL);
+  int seq_id   = bid % num_tiles;
+  int head_id  = (bid / num_tiles) % size<1>(gQL);
+  int batch_id = bid / (num_tiles * size<1>(gQL));
+
+  auto gQ = local_tile(Q(batch_id, head_id, _, _),
+                       make_tile(size<0>(sQL), size<1>(sQL)),
+                       make_coord(seq_id, _0{}));               // (bN, head_dim)
+
+  // auto gK = local_tile(K(batch_id, head_id, _, _),
+  //                      make_tile(size<0>(sKL), size<1>(sKL)),
+  //                      make_coord(_, _));                    // (bK, head_dim, seq_len, 1)
+
+  // auto gV = local_tile(V(batch_id, head_id, _, _),
+  //                      make_tile(size<0>(sVL), size<1>(sVL)),
+  //                      make_coord(_, _));                    // (bK, head_dim, seq_len, 1)
+
+  auto gO = local_tile(O(batch_id, head_id, _, _),
+                       make_tile(size<0>(sOL), size<1>(sOL)),
+                       make_coord(seq_id, _0{}));               // (bN, head_dim)
+
+  Tensor sQ = make_tensor(make_smem_ptr<scalar_t>(qShmem), sQL);   // (bN, head_dim)
+  Tensor sK = make_tensor(make_smem_ptr<scalar_t>(kShmem), sKL);   // (bK, head_dim)
+  Tensor sV = make_tensor(make_smem_ptr<scalar_t>(vShmem), sVL);   // (bK, head_dim)
+  Tensor sV_trans  = make_tensor(make_smem_ptr<scalar_t>(vShmem), make_layout(make_shape(size<1>(sVL), size<0>(sVL))));   // (head_dim, bK)
+  Tensor sO = make_tensor(make_smem_ptr<scalar_t>(oShmem), sOL);   // (bN, head_dim)
+
+  Tensor sP = make_tensor(make_smem_ptr<scalar_t>(pShmem),
+                          make_shape(size<0>(sQL), size<0>(sKL)));  // (bN, bK)
+
+  Tensor row_max = make_tensor(make_smem_ptr<scalar_t>(row_maxShmem),
+                               make_shape(size<0>(sQL)));           // (bN)
+
+  Tensor row_sum = make_tensor(make_smem_ptr<scalar_t>(row_sumShmem),
+                               make_shape(size<0>(sQL)));           // (bN)
+
+  // 初始化 row_max / row_sum
+  if (threadIdx.x < size<0>(row_max)) {
+    row_max(threadIdx.x) = -FLT_MAX;
+    row_sum(threadIdx.x) = 0.0f;
+  }
+  __syncthreads();
+
+  // load gQ to sQ
+  auto g2s_thr_copyQ = g2s_copyQ.get_slice(threadIdx.x);
+  auto tQgQ = g2s_thr_copyQ.partition_S(gQ);   // (CPY, CPY_M, CPY_N)
+  auto tQsQ = g2s_thr_copyQ.partition_D(sQ);   // (CPY, CPY_M, CPY_N)
+
+  // load gK to sK
+  auto g2s_thr_copyK = g2s_copyK.get_slice(threadIdx.x);
+  //auto tKgK = g2s_thr_copyK.partition_S(gK);   // (CPY, CPY_M, CPY_N, seq_len)
+  auto tKsK = g2s_thr_copyK.partition_D(sK);   // (CPY, CPY_M, CPY_N)
+
+  // load gV to sV
+  auto g2s_thr_copyV = g2s_copyV.get_slice(threadIdx.x);
+  //auto tVgV = g2s_thr_copyV.partition_S(gV);   // (CPY, CPY_M, CPY_N, seq_len)
+  auto tVsV = g2s_thr_copyV.partition_D(sV);   // (CPY, CPY_M, CPY_N)
+
+  // mma1 and alloc register
+  auto thr_mma1 = mma1.get_slice(threadIdx.x);
+  auto mma1sQ = thr_mma1.partition_A(sQ);   // (MMA, Mma_M, Mma_K)
+  auto mma1sK = thr_mma1.partition_B(sK);
+  auto mma1sP = thr_mma1.partition_C(sP);   // (MMA, Mma_M, Mma_N)
+  auto mma1rQ = thr_mma1.make_fragment_A(mma1sQ);   // (MMA, Mma_M, Mma_K)
+  auto mma1rK = thr_mma1.make_fragment_B(mma1sK);
+  auto mma1rP = thr_mma1.make_fragment_C(mma1sP);   // (MMA, Mma_M, Mma_N)
+  //clear(mma1rP);
+
+  // mma2 and alloc register
+  auto thr_mma2 = mma2.get_slice(threadIdx.x);
+  auto mma2sP = thr_mma2.partition_A(sP);   // (MMA, Mma_M, Mma_K)
+  auto mma2sV = thr_mma2.partition_B(sV_trans);
+  auto mma2sO = thr_mma2.partition_C(sO);   // (MMA, Mma_M, Mma_N)
+  auto mma2rP = thr_mma2.make_fragment_A(mma2sP);
+  auto mma2rV = thr_mma2.make_fragment_B(mma2sV);
+  auto mma2rO = thr_mma2.make_fragment_C(mma2sO);
+  clear(mma2rO);
+
+  // load gQ to sQ and load sQ to register
+  copy(g2s_copyQ, tQgQ, tQsQ);
+  cp_async_fence();
+  cp_async_wait<0>();
+  __syncthreads();
+  copy(mma1sQ, mma1rQ);
+  scalar_t sm_scale = rsqrtf(size<1>(sQ));  // 1 / sqrt(head_dim)
+
+  for (size_t t = 0; t < size(mma1rQ); ++t) {
+    mma1rQ(t) = to_tf32(mma1rQ(t)* sm_scale);
+  }
+
+  for (size_t i = 0; i < size<2>(gKL) / size<0>(sKL); ++i) {
+    clear(mma1rP);
+    // load gK to sK and load gV to sV
+    auto gK = local_tile(K(batch_id, head_id, _, _),
+                       make_tile(size<0>(sKL), size<1>(sKL)),
+                       make_coord(i, 0));                    // (bK, head_dim)
+    auto tKgK = g2s_thr_copyK.partition_S(gK);
+    copy(g2s_copyK, tKgK, tKsK);
+    cp_async_fence();
+
+    auto gV = local_tile(V(batch_id, head_id, _, _),
+                       make_tile(size<0>(sVL), size<1>(sVL)),
+                       make_coord(i, 0));                    // (bK, head_dim)
+    auto tVgV = g2s_thr_copyV.partition_S(gV);
+    copy(g2s_copyV, tVgV, tVsV);
+    cp_async_fence();
+
+    cp_async_wait<1>();
+    __syncthreads();
+    // load sK to register
+    copy(mma1sK, mma1rK);
+    for (int i = 0; i < size(mma1rK); ++i) {
+      mma1rK(i) = to_tf32(mma1rK(i));
+    }
+    gemm(mma1, mma1rQ, mma1rK, mma1rP);
+
+    copy(mma1rP, mma1sP);
+    __syncthreads();
+
+    int row = threadIdx.x;
+    if (row < size<0>(sP)) {
+      scalar_t row_max_new = row_max(row);
+
+      for (int n = 0; n < size<1>(sP); ++n) {
+        row_max_new = max(row_max_new, sP(row, n));
+      }
+
+      scalar_t sum = 0.0f;
+      scalar_t alpha = exp(row_max(row) - row_max_new);
+
+      for (int d = 0; d < size<1>(sO); ++d) {
+        sO(row, d) = sO(row, d) * alpha;
+      }
+
+      for (int n = 0; n < size<1>(sP); ++n) {
+        sP(row, n) = exp(sP(row, n) - row_max_new);
+        sum += sP(row, n);
+        //sO(row, n) = sO(row, n) * offset;
+      }
+
+      row_sum(row) = row_sum(row) * alpha + sum;
+      row_max(row) = row_max_new;
+    }
+
+    cp_async_wait<0>();
+    __syncthreads();
+
+    copy(mma2sP, mma2rP);
+    copy(mma2sV, mma2rV);
+    for (int i = 0; i < size(mma2rP); ++i) {
+      mma2rP(i) = to_tf32(mma2rP(i));
+    }
+    for (int i = 0; i < size(mma2rV); ++i) {
+      mma2rV(i) = to_tf32(mma2rV(i));
+    }
+
+    copy(mma2sO, mma2rO);
+
+    gemm(mma2, mma2rP, mma2rV, mma2rO);
+    copy(mma2rO, mma2sO);
+    __syncthreads();
+  }
+  // final scale: O /= row_sum
+  if (threadIdx.x < size<0>(sO)) {
+    int row = threadIdx.x;
+    scalar_t denom = row_sum(row);
+    if (denom > 0.0f) {
+      scalar_t inv_denom = 1.0f / denom;
+      for (int d = 0; d < size<1>(sO); ++d) {
+        sO(row, d) = sO(row, d) * inv_denom;
+      }
+    }
+  }
+  __syncthreads();
+
+  copy(sO, gO);
+  return;
+}
+
+                                      
 void FlashAttentionForward(const CudaArray& q, const CudaArray& k, const CudaArray& v,
                           CudaArray* out, size_t batch_size, size_t num_heads,
                           size_t q_len, size_t kv_len,
@@ -655,7 +874,7 @@ void FlashAttentionForward(const CudaArray& q, const CudaArray& k, const CudaArr
   if (out->size != out_size) throw std::runtime_error("flash attention output tensor size does not match the provided metadata");
 
   std::ostringstream msg;
-  msg << "flash attention kernel registered but not implemented"
+  msg << "flash attention kernel"
       << " (batch_size=" << batch_size
       << ", num_heads=" << num_heads
       << ", q_len=" << q_len
@@ -663,7 +882,59 @@ void FlashAttentionForward(const CudaArray& q, const CudaArray& k, const CudaArr
       << ", head_dim=" << head_dim
       << ", dropout=" << dropout
       << ", causal=" << std::boolalpha << causal << ")";
-  throw std::runtime_error(msg.str());
+  
+  std::cout << msg.str() << std::endl;
+
+  using namespace cute;
+  auto gQ = make_layout(make_shape(batch_size, num_heads, q_len, _64{}), LayoutRight{});
+  auto gK = make_layout(make_shape(batch_size, num_heads, kv_len,  _64{}), LayoutRight{});
+  auto gV = make_layout(make_shape(batch_size, num_heads, kv_len, _64{}), LayoutRight{});
+  auto gO = make_layout(make_shape(batch_size, num_heads, q_len, _64{}), LayoutRight{});
+
+  auto bN = Int<16>{};
+  auto bK = Int<16>{};
+
+  auto sQ = make_layout(make_shape(bN,  _64{}), LayoutRight{});
+  auto sK = make_layout(make_shape(bK,  _64{}), LayoutRight{});
+  auto sV = make_layout(make_shape(bK,  _64{}), LayoutRight{});
+  auto sO = make_layout(make_shape(bN,  _64{}), LayoutRight{});
+
+  //copy gobal to share memory
+  auto g2s_copyQ = make_tiled_copy(Copy_Atom<SM80_CP_ASYNC_CACHEALWAYS<uint128_t>, scalar_t>{}, 
+                                  Layout<Shape<_16, _16>, Stride<_16, _1>>{},
+                                  Layout<Shape<_1, _4>>{});
+  auto g2s_copyK = make_tiled_copy(Copy_Atom<SM80_CP_ASYNC_CACHEALWAYS<uint128_t>, scalar_t>{},
+                                  Layout<Shape<_16, _16>, Stride<_16, _1>>{},
+                                  Layout<Shape<_1, _4>>{});
+  auto g2s_copyV = make_tiled_copy(Copy_Atom<SM80_CP_ASYNC_CACHEALWAYS<uint128_t>, scalar_t>{}, 
+                                  Layout<Shape<_16, _16>, Stride<_16, _1>>{},
+                                  Layout<Shape<_1, _4>>{});
+
+  //copy share to register using navie copy 
+  
+  // mma1
+  auto mma1 = make_tiled_mma(MMA_Atom<SM80_16x8x8_F32TF32TF32F32_TN>{},
+                                Layout<Shape<_1, _2, _2>>{},
+                                Tile<_16, _16, _16>{});
+  auto mma2 = make_tiled_mma(MMA_Atom<SM80_16x8x8_F32TF32TF32F32_TN>{},
+                                Layout<Shape<_1, _4, _1>>{},
+                                Tile<_16, _32, _8>{});
+  size_t smem_elems = bN * head_dim * 2 + bK * head_dim * 2 + bN * 2 + bN * bK; // sQ, sK, sV, sO, sP, row_max, row_sum
+
+size_t smem_bytes = smem_elems * sizeof(scalar_t);
+  // parition 
+  dim3 block(128);
+  // assum q_len % 16 == 0
+  dim3 grid(batch_size * num_heads * q_len / bN);
+
+  flash_attention_kernel<<<grid, block, smem_bytes>>>(q.ptr, k.ptr, v.ptr, out->ptr, dropout, causal,
+                                          gQ, gK, gV, gO,
+                                          sQ, sK, sV, sO,
+                                          g2s_copyQ, g2s_copyK, g2s_copyV,
+                                          mma1, mma2);
+
+
+  return;
 }
 #endif
 
@@ -673,7 +944,7 @@ void FlashAttentionForward(const CudaArray& q, const CudaArray& k, const CudaArr
 PYBIND11_MODULE(ndarray_backend_cuda, m) {
   namespace py = pybind11;
   using namespace needle;
-  using namespace cuda;
+  using namespace needle::cuda;;
 
   m.attr("__device_name__") = "cuda";
   m.attr("__tile_size__") = TILE;

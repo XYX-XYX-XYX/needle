@@ -21,13 +21,15 @@ find_package(pybind11 PATHS ${__pybind_path})
 
 
 if(NOT MSVC)
-  set(CMAKE_CXX_FLAGS "-std=c++11 -O2 -march=native ${CMAKE_CXX_FLAGS}")
-  set(CMAKE_CUDA_STANDARD 14)
+  set(CMAKE_CXX_FLAGS "-O2 -march=native ${CMAKE_CXX_FLAGS}")
+  set(CMAKE_CUDA_STANDARD 17)
 else()
-  set(CMAKE_CXX_FLAGS "/std:c++11 -O2 -march=native ${CMAKE_CXX_FLAGS}")
-  set(CMAKE_CUDA_STANDARD 14)
+  set(CMAKE_CXX_FLAGS "-O2 -march=native ${CMAKE_CXX_FLAGS}")
+  set(CMAKE_CUDA_STANDARD 17)
 endif()
-
+set(CMAKE_CXX_STANDARD 17)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
+set(CMAKE_CUDA_STANDARD_REQUIRED ON)
 include_directories(SYSTEM ${pybind11_INCLUDE_DIRS})
 list(APPEND LINKER_LIBS ${pybind11_LIBRARIES})
 

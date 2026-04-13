@@ -5,3 +5,5 @@ build
 __pycache__/
 *.pyc
 *.so
+3rdparty/
+.gitmodules

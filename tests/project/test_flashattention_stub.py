@@ -1,4 +1,5 @@
 import sys
+import re
 
 sys.path.append("./python")
 
@@ -49,11 +50,15 @@ def test_flashattention_module_hits_cuda_stub(causal, dropout, device):
     k_tensor = _tensor_or_skip(q, device)
     v_tensor = _tensor_or_skip(q, device)
 
-    expected = (
-        "flash attention kernel registered but not implemented "
-        f"(batch_size=2, num_heads=4, q_len=8, kv_len=8, head_dim=16, dropout={dropout}, causal={str(causal).lower()})"
+    if dropout == 0.0:
+        dropout_pattern = r"0(?:\.0)?"
+    else:
+        dropout_pattern = re.escape(str(dropout))
+    escaped = (
+        r"flash attention kernel registered but not implemented "
+        r"\(batch_size=2, num_heads=4, q_len=8, kv_len=8, head_dim=16, "
+        rf"dropout={dropout_pattern}, causal={str(causal).lower()}\)"
     )
-    escaped = expected.replace("(", r"\(").replace(")", r"\)")
 
     with pytest.raises(RuntimeError, match=escaped):
         layer(q_tensor, k_tensor, v_tensor)

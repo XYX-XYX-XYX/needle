@@ -13,6 +13,44 @@ CompileFlags:
     - --cuda-host-only
     - --no-cuda-version-check
     - -ferror-limit=0
+    - -DNEEDLE_ENABLE_FLASHATTN_STUB=1
+    - -I/home/xyx/needle/3rdparty/cutlass/include
+    - -I/home/xyx/needle_env/lib/python3.12/site-packages/pybind11/include
+
+    - -std=c++17
+    
+    - -L/usr/local/cuda/lib64
+
+    - -I/usr/include/c++/13
+    - -I/usr/include/aarch64-linux-gnu/c++/13
+    - -I/usr/include/c++/13/backward
+    - -I/usr/lib/gcc/aarch64-linux-gnu/13/include
+    - -I/usr/include/aarch64-linux-gnu
+    - -I/usr/include
+
+    - -I/home/xyx/cutlass/include
+    - -I/home/xyx/cutlass/tools/util/include
+    - -I/home/xyx/cutlass/examples/common
+    - -I/usr/local/cuda/include
+
+    - -I/usr/local/cuda-13.0/targets/sbsa-linux/include/cccl
+    - -I/usr/local/cuda-13.0/targets/sbsa-linux/include
+
+    - -Wno-unknown-attributes
+    - -Wno-unknown-cuda-version
+    - -D__STRICT_ANSI__=0
+
+
+  Remove: 
+    - -forward-unknown-to-host-compiler
+    - --options-file*
+    - --generate-code*
+    - -Xcompiler*
+    - --expt-relaxed-constexpr
+    - -gencode*
+    - --threads*
+
+    
 Diagnostics:
   Suppress:
     - redefinition
@@ -21,3 +59,10 @@ Diagnostics:
     - fatal_too_many_errors
     - ref_bad_target
     - unused-includes
+
+
+    - "drv_unknown_argument"
+    - "cuda_version_unsupported"
+    - "unused-includes"
+    - "typecheck_comparison_of_pointer_integer" # 暂时屏蔽这个 string 比较的警告
+    - "-Wstring-compare"                        # 暂时屏蔽这个 string 比较的警告

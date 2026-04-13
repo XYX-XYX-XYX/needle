@@ -5,7 +5,7 @@ all: lib
 
 lib:
 	@mkdir -p build
-	@cd build; cmake ..
+	@cd build; cmake .. -DNEEDLE_USE_FLASHATTN_STUB=ON
 	@cd build; $(MAKE)
 
 format:
