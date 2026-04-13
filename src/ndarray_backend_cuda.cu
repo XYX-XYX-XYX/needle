@@ -1,4 +1,5 @@
 #include <cstdint>
+#include <cfloat>
 #include <cuda_runtime.h>
 #include <pybind11/numpy.h>
 #include <pybind11/pybind11.h>
@@ -702,7 +703,9 @@ __global__ void flash_attention_kernel(const scalar_t* q, const scalar_t* k, con
   Tensor sQ = make_tensor(make_smem_ptr<scalar_t>(qShmem), sQL);   // (bN, head_dim)
   Tensor sK = make_tensor(make_smem_ptr<scalar_t>(kShmem), sKL);   // (bK, head_dim)
   Tensor sV = make_tensor(make_smem_ptr<scalar_t>(vShmem), sVL);   // (bK, head_dim)
-  Tensor sV_trans  = make_tensor(make_smem_ptr<scalar_t>(vShmem), make_layout(make_shape(size<1>(sVL), size<0>(sVL))));   // (head_dim, bK)
+  Tensor sV_trans  = make_tensor(make_smem_ptr<scalar_t>(vShmem), 
+                                make_layout(make_shape(size<1>(sVL), size<0>(sVL)), 
+                                make_stride(stride<1>(sVL), stride<0>(sVL))));   // (head_dim, bK)
   Tensor sO = make_tensor(make_smem_ptr<scalar_t>(oShmem), sOL);   // (bN, head_dim)
 
   Tensor sP = make_tensor(make_smem_ptr<scalar_t>(pShmem),
@@ -754,7 +757,7 @@ __global__ void flash_attention_kernel(const scalar_t* q, const scalar_t* k, con
   auto mma2rP = thr_mma2.make_fragment_A(mma2sP);
   auto mma2rV = thr_mma2.make_fragment_B(mma2sV);
   auto mma2rO = thr_mma2.make_fragment_C(mma2sO);
-  clear(mma2rO);
+  //clear(mma2rO);
 
   // load gQ to sQ and load sQ to register
   copy(g2s_copyQ, tQgQ, tQsQ);
@@ -789,8 +792,8 @@ __global__ void flash_attention_kernel(const scalar_t* q, const scalar_t* k, con
     __syncthreads();
     // load sK to register
     copy(mma1sK, mma1rK);
-    for (int i = 0; i < size(mma1rK); ++i) {
-      mma1rK(i) = to_tf32(mma1rK(i));
+    for (size_t j = 0; j < size(mma1rK); ++j) {
+      mma1rK(j) = to_tf32(mma1rK(j));
     }
     gemm(mma1, mma1rQ, mma1rK, mma1rP);
 
@@ -845,9 +848,8 @@ __global__ void flash_attention_kernel(const scalar_t* q, const scalar_t* k, con
     int row = threadIdx.x;
     scalar_t denom = row_sum(row);
     if (denom > 0.0f) {
-      scalar_t inv_denom = 1.0f / denom;
       for (int d = 0; d < size<1>(sO); ++d) {
-        sO(row, d) = sO(row, d) * inv_denom;
+        sO(row, d) = sO(row, d) / denom;
       }
     }
   }
@@ -901,13 +903,13 @@ void FlashAttentionForward(const CudaArray& q, const CudaArray& k, const CudaArr
 
   //copy gobal to share memory
   auto g2s_copyQ = make_tiled_copy(Copy_Atom<SM80_CP_ASYNC_CACHEALWAYS<uint128_t>, scalar_t>{}, 
-                                  Layout<Shape<_16, _16>, Stride<_16, _1>>{},
+                                  Layout<Shape<_8, _16>, Stride<_16, _1>>{},
                                   Layout<Shape<_1, _4>>{});
   auto g2s_copyK = make_tiled_copy(Copy_Atom<SM80_CP_ASYNC_CACHEALWAYS<uint128_t>, scalar_t>{},
-                                  Layout<Shape<_16, _16>, Stride<_16, _1>>{},
+                                  Layout<Shape<_8, _16>, Stride<_16, _1>>{},
                                   Layout<Shape<_1, _4>>{});
   auto g2s_copyV = make_tiled_copy(Copy_Atom<SM80_CP_ASYNC_CACHEALWAYS<uint128_t>, scalar_t>{}, 
-                                  Layout<Shape<_16, _16>, Stride<_16, _1>>{},
+                                  Layout<Shape<_8, _16>, Stride<_16, _1>>{},
                                   Layout<Shape<_1, _4>>{});
 
   //copy share to register using navie copy 

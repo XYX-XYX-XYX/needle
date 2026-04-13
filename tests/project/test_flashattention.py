@@ -10,7 +10,7 @@ import needle.nn as nn
 
 np.random.seed(3)
 
-_DEVICES = [ndl.cuda()]
+_DEVICES = [ndl.cpu(), ndl.cuda()]
 
 # @pytest.mark.parametrize("batch_size", [4, 8])
 # @pytest.mark.parametrize("num_heads", [5])
@@ -81,15 +81,15 @@ def test_attention_activation_vs_torch(batch_size, num_heads, queries_len, inner
     k_ndl = ndl.Tensor(k_np, device=device)
     v_ndl = ndl.Tensor(v_np, device=device)
     
-    layer = nn.MultiHeadAttention(
+    layer = nn.FlashMutiHeadAttention(
         dropout=dropout, causal=causal, device=device)
         
-    result_ndl, probs_ndl = layer(q_ndl, k_ndl, v_ndl) # 这里假设输入 Q=K=V 测试 self-attention
+    result_ndl = layer(q_ndl, k_ndl, v_ndl) # 这里假设输入 Q=K=V 测试 self-attention
     # 注意：上面的原始测试中只传了 q, q, q。为了通过测试我们最好也只传 q_ndl
     # 但为了更通用的对比，我们可以稍微修改成传入 distinct Q, K, V
     
     # 按照原始 test_attention_activation 逻辑重写：
-    result_ndl, probs_ndl = layer(q_ndl, k_ndl, v_ndl)
+    # result_ndl, probs_ndl = layer(q_ndl, k_ndl, v_ndl)
     
     res_ndl_val = result_ndl.numpy()
     
