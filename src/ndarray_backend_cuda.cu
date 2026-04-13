@@ -768,7 +768,8 @@ __global__ void flash_attention_kernel(const scalar_t* q, const scalar_t* k, con
   scalar_t sm_scale = rsqrtf(size<1>(sQ));  // 1 / sqrt(head_dim)
 
   for (size_t t = 0; t < size(mma1rQ); ++t) {
-    mma1rQ(t) = to_tf32(mma1rQ(t)* sm_scale);
+    //mma1rQ(t) = to_tf32(mma1rQ(t)* sm_scale);
+    mma1rQ(t) = mma1rQ(t) * sm_scale;
   }
 
   for (size_t i = 0; i < size<2>(gKL) / size<0>(sKL); ++i) {
@@ -792,9 +793,9 @@ __global__ void flash_attention_kernel(const scalar_t* q, const scalar_t* k, con
     __syncthreads();
     // load sK to register
     copy(mma1sK, mma1rK);
-    for (size_t j = 0; j < size(mma1rK); ++j) {
-      mma1rK(j) = to_tf32(mma1rK(j));
-    }
+    // for (size_t j = 0; j < size(mma1rK); ++j) {
+    //   mma1rK(j) = to_tf32(mma1rK(j));
+    // }
     gemm(mma1, mma1rQ, mma1rK, mma1rP);
 
     copy(mma1rP, mma1sP);
@@ -830,12 +831,12 @@ __global__ void flash_attention_kernel(const scalar_t* q, const scalar_t* k, con
 
     copy(mma2sP, mma2rP);
     copy(mma2sV, mma2rV);
-    for (int i = 0; i < size(mma2rP); ++i) {
-      mma2rP(i) = to_tf32(mma2rP(i));
-    }
-    for (int i = 0; i < size(mma2rV); ++i) {
-      mma2rV(i) = to_tf32(mma2rV(i));
-    }
+    // for (int i = 0; i < size(mma2rP); ++i) {
+    //   mma2rP(i) = to_tf32(mma2rP(i));
+    // }
+    // for (int i = 0; i < size(mma2rV); ++i) {
+    //   mma2rV(i) = to_tf32(mma2rV(i));
+    // }
 
     copy(mma2sO, mma2rO);
 
@@ -855,7 +856,9 @@ __global__ void flash_attention_kernel(const scalar_t* q, const scalar_t* k, con
   }
   __syncthreads();
 
-  copy(sO, gO);
+for (int i = threadIdx.x; i < size(sO); i += blockDim.x) {
+    gO(i) = sO(i);
+}
   return;
 }
 
@@ -915,12 +918,16 @@ void FlashAttentionForward(const CudaArray& q, const CudaArray& k, const CudaArr
   //copy share to register using navie copy 
   
   // mma1
-  auto mma1 = make_tiled_mma(MMA_Atom<SM80_16x8x8_F32TF32TF32F32_TN>{},
-                                Layout<Shape<_1, _2, _2>>{},
-                                Tile<_16, _16, _16>{});
-  auto mma2 = make_tiled_mma(MMA_Atom<SM80_16x8x8_F32TF32TF32F32_TN>{},
-                                Layout<Shape<_1, _4, _1>>{},
-                                Tile<_16, _32, _8>{});
+  // auto mma1 = make_tiled_mma(MMA_Atom<SM80_16x8x8_F32TF32TF32F32_TN>{},
+  //                               Layout<Shape<_1, _2, _2>>{},
+  //                               Tile<_16, _16, _16>{});
+  // auto mma2 = make_tiled_mma(MMA_Atom<SM80_16x8x8_F32TF32TF32F32_TN>{},
+  //                               Layout<Shape<_1, _4, _1>>{},
+  //                               Tile<_16, _32, _8>{});
+  auto mma1 = make_tiled_mma(UniversalFMA<scalar_t, scalar_t, scalar_t>{},
+                                Layout<Shape<_16, _8, _1>>{});
+  auto mma2 = make_tiled_mma(UniversalFMA<scalar_t, scalar_t, scalar_t>{},
+                                Layout<Shape<_16, _8, _1>>{});
   size_t smem_elems = bN * head_dim * 2 + bK * head_dim * 2 + bN * 2 + bN * bK; // sQ, sK, sV, sO, sP, row_max, row_sum
 
 size_t smem_bytes = smem_elems * sizeof(scalar_t);
