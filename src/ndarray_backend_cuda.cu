@@ -649,7 +649,7 @@ template <typename GLayoutQ, typename GLayoutK, typename GLayoutV, typename GLay
           typename TileG2SQ, typename TileG2SK, typename TileG2SV,
           typename MMA1, typename MMA2>
 __global__ void flash_attention_kernel(const scalar_t* q, const scalar_t* k, const scalar_t* v,
-                                       scalar_t* o, scalar_t dropout, bool causal,
+                                       scalar_t* o, float dropout, bool causal,
                                        GLayoutQ gQL, GLayoutK gKL, GLayoutV gVL, GLayoutO gOL,
                                        SLayoutQ sQL, SLayoutK sKL, SLayoutV sVL, SLayoutO sOL,
                                        TileG2SQ g2s_copyQ, TileG2SK g2s_copyK, TileG2SV g2s_copyV,
@@ -765,7 +765,7 @@ __global__ void flash_attention_kernel(const scalar_t* q, const scalar_t* k, con
   auto mma2sP = thr_mma2.partition_A(sP);   // (MMA, Mma_M, Mma_K)
   auto mma2sV = thr_mma2.partition_B(sV_trans);
   auto mma2sO = thr_mma2.partition_C(sO);   // (MMA, Mma_M, Mma_N)
-  auto mma2rP = thr_mma2.make_fragment_A(mma2sP);
+  auto mma2rP = make_fragment_like<scalar_t>(mma2sP);
   auto mma2rV = thr_mma2.make_fragment_B(mma2sV);
   auto mma2rO = thr_mma2.make_fragment_C(mma2sO);
   //clear(mma2rO);
@@ -876,7 +876,7 @@ for (int i = threadIdx.x; i < size(sO); i += blockDim.x) {
 void FlashAttentionForward(const CudaArray& q, const CudaArray& k, const CudaArray& v,
                           CudaArray* out, size_t batch_size, size_t num_heads,
                           size_t q_len, size_t kv_len,
-                          size_t head_dim, scalar_t dropout, bool causal) {
+                          size_t head_dim, float dropout, bool causal) {
   (void)sizeof(cutlass::Status);
 
   const size_t q_size = batch_size * num_heads * q_len * head_dim;
@@ -988,15 +988,24 @@ PYBIND11_MODULE(ndarray_backend_cuda, m) {
     cudaError_t err = cudaMemcpy(host_ptr, a.ptr, a.size * ELEM_SIZE, cudaMemcpyDeviceToHost);
     if (err != cudaSuccess) throw std::runtime_error(cudaGetErrorString(err));
 
-    // return numpy array
+    // Return a NumPy float16 array. pybind11 does not have built-in NumPy
+    // type info for cutlass::half_t, but the underlying binary layout matches.
+    py::dtype float16_dtype = py::module_::import("numpy").attr("dtype")("float16");
     py::capsule deallocate_buffer(host_ptr, [](void* p) { free(p); });
-    return py::array_t<scalar_t>(shape, numpy_strides, host_ptr + offset, deallocate_buffer);
+    return py::array(float16_dtype, shape, numpy_strides, host_ptr + offset, deallocate_buffer);
   });
 
   // copy numpy array to GPU
-  m.def("from_numpy", [](py::array_t<scalar_t> a, CudaArray* out) {
+  m.def("from_numpy", [](py::array a, CudaArray* out) {
+    py::dtype float16_dtype = py::module_::import("numpy").attr("dtype")("float16");
+    py::array host_array =
+        py::module_::import("numpy").attr("ascontiguousarray")(a, float16_dtype);
+    py::buffer_info buf = host_array.request();
+    if (static_cast<size_t>(buf.size) != out->size) {
+      throw std::runtime_error("from_numpy size mismatch for CUDA float16 array");
+    }
     cudaError_t err =
-        cudaMemcpy(out->ptr, a.request().ptr, out->size * ELEM_SIZE, cudaMemcpyHostToDevice);
+        cudaMemcpy(out->ptr, buf.ptr, out->size * ELEM_SIZE, cudaMemcpyHostToDevice);
     if (err != cudaSuccess) throw std::runtime_error(cudaGetErrorString(err));
   });
 
