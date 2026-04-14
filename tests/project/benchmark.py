@@ -18,9 +18,9 @@ def benchmark_flash_attention(batch_size, num_heads, seq_len, head_dim, causal, 
     
     # 构造数据
     shape = (batch_size, num_heads, seq_len, head_dim)
-    q_np = np.random.randn(*shape).astype(np.float32)
-    k_np = np.random.randn(*shape).astype(np.float32)
-    v_np = np.random.randn(*shape).astype(np.float32)
+    q_np = np.random.randn(*shape).astype(np.float16)
+    k_np = np.random.randn(*shape).astype(np.float16)
+    v_np = np.random.randn(*shape).astype(np.float16)
     
     q_ndl = ndl.Tensor(q_np, device=device)
     k_ndl = ndl.Tensor(k_np, device=device)

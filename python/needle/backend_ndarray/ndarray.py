@@ -715,7 +715,7 @@ class NDArray:
 def array(a: Any, dtype: str = "float32", device: BackendDevice | None = None) -> NDArray:
     """Convenience methods to match numpy a bit more closely."""
     dtype = "float32" if dtype is None else dtype
-    assert dtype == "float32"
+    assert dtype == "float32" | dtype == "float16"
     return NDArray(a, device=device)
 
 

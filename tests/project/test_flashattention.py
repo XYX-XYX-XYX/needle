@@ -68,9 +68,9 @@ def test_attention_activation_vs_torch(batch_size, num_heads, queries_len, inner
     np.random.seed(19943)
     
     # 构造Q, K, V数据 (Match default Needle MultiHeadAttention shape: B, H, L, D)
-    q_np = np.random.randn(batch_size, num_heads, queries_len, inner_dim).astype(np.float32)
-    k_np = np.random.randn(batch_size, num_heads, queries_len, inner_dim).astype(np.float32)
-    v_np = np.random.randn(batch_size, num_heads, queries_len, inner_dim).astype(np.float32)
+    q_np = np.random.randn(batch_size, num_heads, queries_len, inner_dim).astype(np.float16)
+    k_np = np.random.randn(batch_size, num_heads, queries_len, inner_dim).astype(np.float16)
+    v_np = np.random.randn(batch_size, num_heads, queries_len, inner_dim).astype(np.float16)
 
     # --- Needle 运行 ---
     # MultiHeadAttention 的输入就是 (B, H, L, D)
@@ -82,7 +82,7 @@ def test_attention_activation_vs_torch(batch_size, num_heads, queries_len, inner
     v_ndl = ndl.Tensor(v_np, device=device)
     
     layer = nn.FlashMutiHeadAttention(
-        dropout=dropout, causal=causal, device=device)
+        dropout=dropout, causal=causal, device=device, dtype="float16")
         
     result_ndl = layer(q_ndl, k_ndl, v_ndl) # 这里假设输入 Q=K=V 测试 self-attention
     # 注意：上面的原始测试中只传了 q, q, q。为了通过测试我们最好也只传 q_ndl
@@ -107,7 +107,7 @@ def test_attention_activation_vs_torch(batch_size, num_heads, queries_len, inner
         dropout_p=dropout,
         is_causal=causal
     )
-    
+    print(out_torch.dtype)
     res_torch_val = out_torch.cpu().numpy()
     
     # --- 对比 ---
