@@ -927,17 +927,17 @@ void FlashAttentionForward(const CudaArray& q, const CudaArray& k, const CudaArr
 
   //copy share to register using navie copy 
   
-  // mma1
-  // auto mma1 = make_tiled_mma(MMA_Atom<SM80_16x8x8_F32TF32TF32F32_TN>{},
-  //                               Layout<Shape<_1, _2, _2>>{},
-  //                               Tile<_16, _16, _16>{});
-  // auto mma2 = make_tiled_mma(MMA_Atom<SM80_16x8x8_F32TF32TF32F32_TN>{},
-  //                               Layout<Shape<_1, _4, _1>>{},
-  //                               Tile<_16, _32, _8>{});
-  auto mma1 = make_tiled_mma(UniversalFMA<scalar_t, scalar_t, float>{},
-                                Layout<Shape<_16, _8, _1>>{});
-  auto mma2 = make_tiled_mma(UniversalFMA<scalar_t, scalar_t, float>{},
-                                Layout<Shape<_16, _8, _1>>{});
+  //mma1
+  auto mma1 = make_tiled_mma(MMA_Atom<SM80_16x8x16_F32F16F16F32_TN>{},
+                                Layout<Shape<_1, _2, _2>>{},
+                                Tile<_16, _16, _32>{});
+  auto mma2 = make_tiled_mma(MMA_Atom<SM80_16x8x16_F32F16F16F32_TN>{},
+                                Layout<Shape<_1, _4, _1>>{},
+                                Tile<_16, _32, _16>{});
+  // auto mma1 = make_tiled_mma(UniversalFMA<scalar_t, scalar_t, float>{},
+  //                               Layout<Shape<_16, _8, _1>>{});
+  // auto mma2 = make_tiled_mma(UniversalFMA<scalar_t, scalar_t, float>{},
+  //                               Layout<Shape<_16, _8, _1>>{});
   size_t smem_elems_half = (bN + bK + bK) * head_dim;
   size_t smem_elems_float = bN * 2 + bN * bK + bN * head_dim; // sQ, sK, sV, sO, sP, row_max, row_sum
   size_t smem_half_bytes = smem_elems_half * sizeof(scalar_t);

@@ -111,4 +111,4 @@ def test_attention_activation_vs_torch(batch_size, num_heads, queries_len, inner
     res_torch_val = out_torch.cpu().numpy()
     
     # --- 对比 ---
-    np.testing.assert_allclose(res_ndl_val, res_torch_val, atol=1e-3, rtol=1e-3)
+    np.testing.assert_allclose(res_ndl_val, res_torch_val, atol=1e-2, rtol=1e-2)

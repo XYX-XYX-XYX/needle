@@ -1,0 +1,1 @@
+FMA navie kernel Average Latency: 9.648 ms. Approx. TFLOPS: 2.671
