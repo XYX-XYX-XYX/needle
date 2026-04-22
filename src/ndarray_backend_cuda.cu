@@ -13,6 +13,7 @@
 #include <cute/tensor.hpp>
 #include <cutlass/numeric_types.h>
 #include <cutlass/numeric_conversion.h>
+#include <cute/util/print.hpp>
 #endif
 
 namespace needle {
@@ -770,6 +771,14 @@ __global__ void flash_attention_kernel(const scalar_t* q, const scalar_t* k, con
   auto mma2rO = thr_mma2.make_fragment_C(mma2sO);
   //clear(mma2rO);
 
+
+  // print mma1 accumulator and mma3 operand A
+  if (thread0() && blockIdx.x == 0 && blockIdx.y == 0 && blockIdx.z == 0) 
+  {
+    print(mma2rP);
+    print(mma1rP);
+  }
+
   // load gQ to sQ and load sQ to register
   copy(g2s_copyQ, tQgQ, tQsQ);
   cp_async_fence();
@@ -928,12 +937,12 @@ void FlashAttentionForward(const CudaArray& q, const CudaArray& k, const CudaArr
   //copy share to register using navie copy 
   
   //mma1
-  auto mma1 = make_tiled_mma(MMA_Atom<SM80_16x8x16_F32F16F16F32_TN>{},
+  auto mma1 = make_tiled_mma(MMA_Atom<SM80_16x8x8_F32F16F16F32_TN>{},
                                 Layout<Shape<_1, _2, _2>>{},
-                                Tile<_16, _16, _32>{});
-  auto mma2 = make_tiled_mma(MMA_Atom<SM80_16x8x16_F32F16F16F32_TN>{},
+                                Tile<_16, _16, _16>{});
+  auto mma2 = make_tiled_mma(MMA_Atom<SM80_16x8x8_F32F16F16F32_TN>{},
                                 Layout<Shape<_1, _4, _1>>{},
-                                Tile<_16, _32, _16>{});
+                                Tile<_16, _32, _8>{});
   // auto mma1 = make_tiled_mma(UniversalFMA<scalar_t, scalar_t, float>{},
   //                               Layout<Shape<_16, _8, _1>>{});
   // auto mma2 = make_tiled_mma(UniversalFMA<scalar_t, scalar_t, float>{},

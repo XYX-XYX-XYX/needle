@@ -7,3 +7,4 @@ __pycache__/
 *.so
 3rdparty/
 .gitmodules
+benchmark.txt
