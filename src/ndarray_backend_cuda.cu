@@ -8,6 +8,8 @@
 #include <iostream>
 #include <sstream>
 
+#include <cassert>
+
 #ifdef NEEDLE_ENABLE_FLASHATTN_STUB
 #include <cutlass/cutlass.h>
 #include <cute/tensor.hpp>
@@ -716,13 +718,6 @@ __global__ void flash_attention_kernel(const scalar_t* q, const scalar_t* k, con
                        make_tile(size<0>(sQL), size<1>(sQL)),
                        make_coord(seq_id, _0{}));               // (bN, head_dim)
 
-  // auto gK = local_tile(K(batch_id, head_id, _, _),
-  //                      make_tile(size<0>(sKL), size<1>(sKL)),
-  //                      make_coord(_, _));                    // (bK, head_dim, seq_len, 1)
-
-  // auto gV = local_tile(V(batch_id, head_id, _, _),
-  //                      make_tile(size<0>(sVL), size<1>(sVL)),
-  //                      make_coord(_, _));                    // (bK, head_dim, seq_len, 1)
 
   auto gO = local_tile(O(batch_id, head_id, _, _),
                        make_tile(size<0>(sOL), size<1>(sOL)),
@@ -759,12 +754,10 @@ __global__ void flash_attention_kernel(const scalar_t* q, const scalar_t* k, con
 
   // load gK to sK
   auto g2s_thr_copyK = g2s_copyK.get_slice(threadIdx.x);
-  //auto tKgK = g2s_thr_copyK.partition_S(gK);   // (CPY, CPY_M, CPY_N, seq_len)
   auto tKsK = g2s_thr_copyK.partition_D(sK);   // (CPY, CPY_M, CPY_N)
 
   // load gV to sV
   auto g2s_thr_copyV = g2s_copyV.get_slice(threadIdx.x);
-  //auto tVgV = g2s_thr_copyV.partition_S(gV);   // (CPY, CPY_M, CPY_N, seq_len)
   auto tVsV = g2s_thr_copyV.partition_D(sV);   // (CPY, CPY_M, CPY_N)
 
   // mma1 and alloc register
@@ -787,13 +780,15 @@ __global__ void flash_attention_kernel(const scalar_t* q, const scalar_t* k, con
   auto mma2rP = make_fragment_like<scalar_t>(mma2sP);
   auto mma2rV = thr_mma2.make_fragment_B(mma2sV);
   auto mma2rO = thr_mma2.make_fragment_C(mma2sO);
-  //clear(mma2rO);
-  // if(thread0()) {
-  //   print(mma2sP);
-  //   print(mma2rP_half);
-  //   print(mma2rP_float);
-  //   print(mma2rP);
-  // }
+
+  if(thread0()) {
+    print(mma1sP);
+    print(mma1rP);
+    print(mma2sP);
+    print(mma2rP_float);
+    print(mma2rP);
+  }
+
   // load gQ to sQ and load sQ to register
   copy(g2s_copyQ, tQgQ, tQsQ);
   cp_async_fence();
@@ -925,8 +920,8 @@ void FlashAttentionForward(const CudaArray& q, const CudaArray& k, const CudaArr
   auto gV = make_layout(make_shape(batch_size, num_heads, kv_len, _64{}), LayoutRight{});
   auto gO = make_layout(make_shape(batch_size, num_heads, q_len, _64{}), LayoutRight{});
 
-  auto bN = Int<16>{};
-  auto bK = Int<16>{};
+  auto bN = Int<64>{};
+  auto bK = Int<64>{};
 
   auto sQ = make_layout(make_shape(bN,  _64{}), LayoutRight{});
   auto sK = make_layout(make_shape(bK,  _64{}), LayoutRight{});
@@ -947,12 +942,12 @@ void FlashAttentionForward(const CudaArray& q, const CudaArray& k, const CudaArr
   //copy share to register using navie copy 
   
   //mma1
-  auto mma1 = make_tiled_mma(MMA_Atom<SM80_16x8x16_F32F16F16F32_TN>{},
-                                Layout<Shape<_1, _2, _1>>{},
-                                Tile<_16, _16, _16>{});
-  auto mma2 = make_tiled_mma(MMA_Atom<SM80_16x8x16_F32F16F16F32_TN>{},
+  auto mma1 = make_tiled_mma(MMA_Atom<SM80_16x8x8_F32F16F16F32_TN>{},
                                 Layout<Shape<_1, _4, _1>>{},
-                                Tile<_16, _32, _16>{});
+                                Tile<_16, _32, _8>{});
+  auto mma2 = make_tiled_mma(MMA_Atom<SM80_16x8x8_F32F16F16F32_TN>{},
+                                Layout<Shape<_1, _4, _1>>{},
+                                Tile<_16, _32, _8>{});
   // auto mma1 = make_tiled_mma(UniversalFMA<scalar_t, scalar_t, float>{},
   //                               Layout<Shape<_16, _8, _1>>{});
   // auto mma2 = make_tiled_mma(UniversalFMA<scalar_t, scalar_t, float>{},
@@ -965,6 +960,7 @@ void FlashAttentionForward(const CudaArray& q, const CudaArray& k, const CudaArr
   // parition 
   dim3 block(128);
   // assum q_len % 16 == 0
+  assert(q_len % 64 == 0);
   dim3 grid(batch_size * num_heads * q_len / bN);
 
   flash_attention_kernel<<<grid, block, smem_bytes>>>(q.ptr, k.ptr, v.ptr, out->ptr, dropout, causal,
