@@ -645,6 +645,23 @@ struct CudaArray {
 
 #ifdef NEEDLE_ENABLE_FLASHATTN_STUB
 
+using namespace cute;
+
+template <typename Engine, typename Layout, typename EngineOut>
+CUTLASS_DEVICE void convert_type_out(Tensor<Engine, Layout> const &tensor, Tensor<EngineOut, Layout> &out) {
+    // Somehow if we allocate out inside this function and return it, e2e is slower and the output can be wrong.
+    using From_type = typename Engine::value_type;
+    using To_type = typename EngineOut::value_type;
+    static constexpr int FragmentSize = (sizeof(From_type) > sizeof(To_type)) ? (sizeof(From_type) / sizeof(To_type)) : (sizeof(To_type) / sizeof(From_type));    
+    static_assert(CUTE_STATIC_V(size(tensor)) % FragmentSize == 0, "Fragment size does not vectorize properly");
+    Tensor frag = recast<cutlass::Array<From_type, FragmentSize> const>(tensor);
+    Tensor out_frg = recast<cutlass::Array<To_type, FragmentSize>>(out);
+    static_assert(size(frag) == size(out_frg));
+    cutlass::NumericArrayConverter<To_type, From_type, FragmentSize> convert_op;
+    #pragma unroll
+    for (int i = 0; i < size(frag); ++i) { out_frg[i] = convert_op(frag[i]); }
+}
+
 template <typename GLayoutQ, typename GLayoutK, typename GLayoutV, typename GLayoutO,
           typename SLayoutQ, typename SLayoutK, typename SLayoutV, typename SLayoutO,
           typename TileG2SQ, typename TileG2SK, typename TileG2SV,
@@ -656,7 +673,6 @@ __global__ void flash_attention_kernel(const scalar_t* q, const scalar_t* k, con
                                        TileG2SQ g2s_copyQ, TileG2SK g2s_copyK, TileG2SV g2s_copyV,
                                        MMA1 mma1, MMA2 mma2)
 {
-  using namespace cute;
 
   extern __shared__ __align__(sizeof(float)) unsigned char smem[];
 
@@ -766,19 +782,18 @@ __global__ void flash_attention_kernel(const scalar_t* q, const scalar_t* k, con
   auto mma2sP = thr_mma2.partition_A(sP);   // (MMA, Mma_M, Mma_K)
   auto mma2sV = thr_mma2.partition_B(sV_trans);
   auto mma2sO = thr_mma2.partition_C(sO);   // (MMA, Mma_M, Mma_N)
+  // auto mma2rP = thr_mma2.make_fragment_A(mma2sP);   // (MMA, Mma_M, Mma_K)
+  auto mma2rP_float = make_fragment_like<float>(mma2sP);   // (MMA, Mma_M, Mma_K)
   auto mma2rP = make_fragment_like<scalar_t>(mma2sP);
   auto mma2rV = thr_mma2.make_fragment_B(mma2sV);
   auto mma2rO = thr_mma2.make_fragment_C(mma2sO);
   //clear(mma2rO);
-
-
-  // print mma1 accumulator and mma3 operand A
-  if (thread0() && blockIdx.x == 0 && blockIdx.y == 0 && blockIdx.z == 0) 
-  {
-    print(mma2rP);
-    print(mma1rP);
-  }
-
+  // if(thread0()) {
+  //   print(mma2sP);
+  //   print(mma2rP_half);
+  //   print(mma2rP_float);
+  //   print(mma2rP);
+  // }
   // load gQ to sQ and load sQ to register
   copy(g2s_copyQ, tQgQ, tQsQ);
   cp_async_fence();
@@ -813,9 +828,8 @@ __global__ void flash_attention_kernel(const scalar_t* q, const scalar_t* k, con
     __syncthreads();
     // load sK to register
     copy(mma1sK, mma1rK);
-    // for (size_t j = 0; j < size(mma1rK); ++j) {
-    //   mma1rK(j) = to_tf32(mma1rK(j));
-    // }
+
+
     gemm(mma1, mma1rQ, mma1rK, mma1rP);
 
     copy(mma1rP, mma1sP);
@@ -849,14 +863,10 @@ __global__ void flash_attention_kernel(const scalar_t* q, const scalar_t* k, con
     cp_async_wait<0>();
     __syncthreads();
 
-    copy(mma2sP, mma2rP);
+    copy(mma2sP, mma2rP_float);
+    convert_type_out(mma2rP_float, mma2rP);
     copy(mma2sV, mma2rV);
-    // for (int i = 0; i < size(mma2rP); ++i) {
-    //   mma2rP(i) = to_tf32(mma2rP(i));
-    // }
-    // for (int i = 0; i < size(mma2rV); ++i) {
-    //   mma2rV(i) = to_tf32(mma2rV(i));
-    // }
+
 
     copy(mma2sO, mma2rO);
 
@@ -937,12 +947,12 @@ void FlashAttentionForward(const CudaArray& q, const CudaArray& k, const CudaArr
   //copy share to register using navie copy 
   
   //mma1
-  auto mma1 = make_tiled_mma(MMA_Atom<SM80_16x8x8_F32F16F16F32_TN>{},
-                                Layout<Shape<_1, _2, _2>>{},
+  auto mma1 = make_tiled_mma(MMA_Atom<SM80_16x8x16_F32F16F16F32_TN>{},
+                                Layout<Shape<_1, _2, _1>>{},
                                 Tile<_16, _16, _16>{});
-  auto mma2 = make_tiled_mma(MMA_Atom<SM80_16x8x8_F32F16F16F32_TN>{},
+  auto mma2 = make_tiled_mma(MMA_Atom<SM80_16x8x16_F32F16F16F32_TN>{},
                                 Layout<Shape<_1, _4, _1>>{},
-                                Tile<_16, _32, _8>{});
+                                Tile<_16, _32, _16>{});
   // auto mma1 = make_tiled_mma(UniversalFMA<scalar_t, scalar_t, float>{},
   //                               Layout<Shape<_16, _8, _1>>{});
   // auto mma2 = make_tiled_mma(UniversalFMA<scalar_t, scalar_t, float>{},

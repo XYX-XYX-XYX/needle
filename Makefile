@@ -1,15 +1,20 @@
-.PHONY: lib, pybind, clean, format, all
+.PHONY: lib pybind clean format all
+
+PYTHON := /root/miniconda3/envs/needle/bin/python3
 
 all: lib
 
-
 lib:
 	@mkdir -p build
-	@cd build; cmake .. -DNEEDLE_USE_FLASHATTN_STUB=ON
+	@cd build; cmake .. \
+		-DNEEDLE_USE_FLASHATTN_STUB=ON \
+		-DPython_EXECUTABLE=$(PYTHON) \
+		-DPython3_EXECUTABLE=$(PYTHON) \
+		-DPYTHON_EXECUTABLE=$(PYTHON)
 	@cd build; $(MAKE)
 
 format:
-	python3 -m black .
+	$(PYTHON) -m black .
 	clang-format -i src/*.cc src/*.cu
 
 clean:
