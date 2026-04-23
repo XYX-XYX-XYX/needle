@@ -339,10 +339,10 @@ void FlashAttentionForward(const CudaArray& q, const CudaArray& k, const CudaArr
   
   //mma1
   auto mma1 = make_tiled_mma(MMA_Atom<SM80_16x8x8_F32F16F16F32_TN>{},
-                                Layout<Shape<_4, _ 1, _1>>{},
+                                Layout<Shape<_4, _1, _1>>{},
                                 Tile<_64, _8, _8>{});
-  auto mma2 = make_tiled_mma(MMA_Atom<SM80_16x8x16_F32F16F16F32_TN>{},
-                                Layout<Shape<_4, _ 1, _1>>{},
+  auto mma2 = make_tiled_mma(MMA_Atom<SM80_16x8x8_F32F16F16F32_TN>{},
+                                Layout<Shape<_4, _1, _1>>{},
                                 Tile<_64, _8, _8>{});
   // auto mma1 = make_tiled_mma(UniversalFMA<scalar_t, scalar_t, float>{},
   //                               Layout<Shape<_16, _8, _1>>{});
