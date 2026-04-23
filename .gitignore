@@ -1,12 +1,10 @@
 .cache
 .pytest_cache
 build
-/data
+data
 __pycache__/
 *.pyc
 *.so
 3rdparty/
 .gitmodules
-benchmark.txt
-debug.txt
 Makefile
