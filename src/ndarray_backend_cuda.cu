@@ -16,6 +16,7 @@
 #include <cutlass/numeric_types.h>
 #include <cutlass/numeric_conversion.h>
 #include <cute/util/print.hpp>
+#include <cute/util/print_latex.hpp>
 #endif
 
 namespace needle {
@@ -178,11 +179,13 @@ __global__ void flash_attention_kernel(const scalar_t* q, const scalar_t* k, con
   auto mma2rO = thr_mma2.make_fragment_C(mma2sO);
 
   if(thread0()) {
-    print(mma1sP);
-    print(mma1rP);
-    print(mma2sP);
-    print(mma2rP_float);
-    print(mma2rP);
+    print(mma1sP); print("\n");
+    print(mma1rP); print("\n");
+    print(mma2sP); print("\n");
+    print(mma2rP_float); print("\n");
+    print(mma2rP); print("\n");
+    print_latex(mma1); print("\n");
+    print_latex(mma2); print("\n");
   }
 
   // load gQ to sQ and load sQ to register
