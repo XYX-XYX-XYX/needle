@@ -61,7 +61,7 @@ CUTLASS_DEVICE void convert_type_out(Tensor<Engine, Layout> const &tensor, Tenso
     for (int i = 0; i < size(frag); ++i) { out_frg[i] = convert_op(frag[i]); }
 }
 
-template<typename FragmentP, typename FragmentO>
+template<bool isFirst, typename FragmentP, typename FragmentO>
 CUTLASS_DEVICE void online_softmax(FragmentP& rP, float* row_max, float* row_sum, FragmentO& rO) 
 {
   float row_max_new[2] = {row_max[0], row_max[1]};
@@ -102,16 +102,25 @@ CUTLASS_DEVICE void online_softmax(FragmentP& rP, float* row_max, float* row_sum
   row_sum_new[1] += __shfl_xor_sync(mask, row_sum_new[1], 2, 4);
 
   //update rO
-  for(size_t i = 0; i < size<2>(rO); i++) {
-    for(size_t j = 0; j < size<0, 0>(rO); j++) {
-      rO(make_coord(j, 0), 0, i) = rO(make_coord(j, 0), 0, i) * alph[0];
-      rO(make_coord(j, 1), 0, i) = rO(make_coord(j, 1), 0, i) * alph[1];
+  if(!isFirst) {
+    for(size_t i = 0; i < size<2>(rO); i++) {
+      for(size_t j = 0; j < size<0, 0>(rO); j++) {
+        rO(make_coord(j, 0), 0, i) = rO(make_coord(j, 0), 0, i) * alph[0];
+        rO(make_coord(j, 1), 0, i) = rO(make_coord(j, 1), 0, i) * alph[1];
+      }
     }
   }
 
+
   //update row_max and row_sum
-  row_sum[0] = row_sum_new[0] + row_sum[0] * alph[0];
-  row_sum[1] = row_sum_new[1] + row_sum[1] * alph[1];
+  if(!isFirst) {
+    row_sum[0] = row_sum_new[0] + row_sum[0] * alph[0];
+    row_sum[1] = row_sum_new[1] + row_sum[1] * alph[1];
+  } else {
+    row_sum[0] = row_sum_new[0];
+    row_sum[1] = row_sum_new[1];
+  }
+
   row_max[0] = row_max_new[0];
   row_max[1] = row_max_new[1];
 
@@ -154,10 +163,10 @@ __global__ void flash_attention_kernel(const scalar_t* q, const scalar_t* k, con
   float row_max[2] = {-FLT_MAX, -FLT_MAX};
   float row_sum[2] = {0.0f, 0.0f};
 
-  for (int i = threadIdx.x; i < size(sOL); i += blockDim.x) {
-    oShmem[i] = 0.0f;
-  }
-  __syncthreads();
+  // for (int i = threadIdx.x; i < size(sOL); i += blockDim.x) {
+  //   oShmem[i] = 0.0f;
+  // }
+  // __syncthreads();
 
   Tensor Q = make_tensor(make_gmem_ptr<scalar_t>(q), gQL);   // (batch_size, num_heads, q_len, head_dim)
   Tensor K = make_tensor(make_gmem_ptr<scalar_t>(k), gKL);   // (batch_size, num_heads, kv_len, head_dim)
@@ -290,8 +299,12 @@ __global__ void flash_attention_kernel(const scalar_t* q, const scalar_t* k, con
 
     // copy(mma1rP, mma1sP);
     //__syncthreads();
+    if(t == 0) {
+      online_softmax<true>(mma1rP, row_max, row_sum, mma2rO);
+    } else {
+      online_softmax<false>(mma1rP, row_max, row_sum, mma2rO);
+    }
 
-    online_softmax(mma1rP, row_max, row_sum, mma2rO);
     // int row = threadIdx.x;
     // if (row < size<0>(sP)) {
     //   float row_max_new = row_max(row);

@@ -1,42 +1,3 @@
-smem_ptr[32b](0x7f9d51005000) o ((_2,_2),_2,_1):((_32,_8),_16,_0)
-ptr[32b](0x7f9d4ffffc00) o ((_2,_2),_2,_1):((_1,_2),_4,_0)
-smem_ptr[32b](0x7f9d51005000) o ((_2,_2),_2,_4):((_32,_8),_16,_256)
-ptr[32b](0x7f9d4ffffc20) o ((_2,_2),_2,_4):((_1,_2),_4,_8)
-ptr[16b](0x7f9d4ffffca0) o ((_2,_2),_2,_4):((_1,_2),_4,_8)
-torch.float16
-
- if(thread0()) {
-    print(mma1sP);
-    print(mma1rP);
-    print(mma2sP);
-    print(mma2rP_float);
-    print(mma2rP);
-  }
-
-smem_ptr[32b](0x7f7cc9005000) o ((_2,_2),_2,_1):((_32,_8),_16,_0)
-ptr[32b](0x7f7cc7fffc00) o ((_2,_2),_2,_1):((_1,_2),_4,_0)
-smem_ptr[32b](0x7f7cc9005000) o ((_2,_2),_2,_4):((_32,_8),_16,_256)
-ptr[32b](0x7f7cc7fffc20) o ((_2,_2),_2,_4):((_1,_2),_4,_8)
-ptr[16b](0x7f7cc7fffca0) o ((_2,_2),_2,_4):((_1,_2),_4,_8)
-torch.float16
-
-smem_ptr[32b](0x7fac95005000) o ((_2,_2),_1,_2):((_32,_8),_0,_512)
-ptr[32b](0x7fac93fffc60) o ((_2,_2),_1,_2):((_1,_2),_0,_4)
-smem_ptr[32b](0x7fac95005000) o ((_2,_2,_2),_1,_2):((_32,_8,_256),_0,_512)
-ptr[32b](0x7fac93fffc80) o ((_2,_2,_2),_1,_2):((_1,_2,_4),_0,_8)
-ptr[16b](0x7fac93fffcc0) o ((_2,_2,_2),_1,_2):((_1,_2,_4),_0,_8)
-torch.float16
-
-smem_ptr[32b](0x7f551100a000) o ((_2,_2),_1,_8):((_64,_8),_0,_512)
-ptr[32b](0x7f550ffffba0) o ((_2,_2),_1,_8):((_1,_2),_0,_4)
-smem_ptr[32b](0x7f551100a000) o ((_2,_2),_1,_8):((_64,_8),_0,_512)
-ptr[32b](0x7f550ffffc20) o ((_2,_2),_1,_8):((_1,_2),_0,_4)
-ptr[16b](0x7f550ffffca0) o ((_2,_2),_1,_8):((_1,_2),_0,_4)
-torch.float16
-
-
-
-
 [1m============================= test session starts ==============================[0m
 platform linux -- Python 3.10.19, pytest-9.0.2, pluggy-1.6.0 -- /root/miniconda3/envs/needle/bin/python3
 cachedir: .pytest_cache
@@ -45,11 +6,14 @@ rootdir: /root/needle
 collected 96 items / 95 deselected / 1 selected
 
 tests/project/test_flashattention.py::test_attention_activation_vs_torch[cuda-0.0-False-64-1024-5-2] flash attention kernel (batch_size=2, num_heads=5, q_len=1024, kv_len=1024, head_dim=64, dropout=0, causal=false)
-smem_ptr[32b](0x7ff73100a000) o ((_2,_2),_1,_8):((_64,_8),_0,_512)
-ptr[32b](0x7ff72ffff9a0) o ((_2,_2),_1,_8):((_1,_2),_0,_4)
-smem_ptr[32b](0x7ff73100a000) o ((_2,_2),_1,_8):((_64,_8),_0,_512)
-ptr[32b](0x7ff72ffffa20) o ((_2,_2),_1,_8):((_1,_2),_0,_4)
-ptr[16b](0x7ff72ffffaa0) o ((_2,_2),_1,_8):((_1,_2),_0,_4)
+smem_ptr[32b](0x7fd1d100a000) o ((_2,_2),_1,_8):((_64,_8),_0,_512) mma1sP
+ptr[32b](0x7fd1cffffba0) o ((_2,_2),_1,_8):((_1,_2),_0,_4)         mma1rP
+smem_ptr[32b](0x7fd1d100a000) o ((_2,_2),_1,_8):((_64,_8),_0,_512) mma2sP
+ptr[16b](0x7fd1cffffc20) o ((_2,_2),_1,_8):((_1,_2),_0,_4)         mma2rP
+smem_ptr[32b](0x7fd1d1006000) o ((_2,_2),_1,_8):((_1,_512),_0,_8)  mma2sO
+ptr[32b](0x7fd1cffffc60) o ((_2,_2),_1,_8):((_1,_2),_0,_4)         mma2rO
+
+
 % LayoutC: ArithTuple(_0,_0) o ((_4,_8,_4),((_2,_2),(_1,_1))):((_2@1,_1@0,_16@0),((_1@1,_8@0),(_0,_0)))
 % LayoutA: ArithTuple(_0,_0) o ((_4,_8,_4),((_2,_2),(_1,_1))):((_2@1,_1@0,_16@0),((_1@1,_8@0),(_0,_0)))
 % LayoutB: ArithTuple(_0,_0) o ((_4,_8,_4),(_2,(_1,_1))):((_2@1,_1@0,_0),(_1@1,(_0,_0)))
@@ -2439,6 +2403,155 @@ ptr[16b](0x7ff72ffffaa0) o ((_2,_2),_1,_8):((_1,_2),_0,_4)
 \end{document}
 
 torch.float16
-[32mPASSED[0m
+[31mFAILED[0m
 
-[32m======================= [32m[1m1 passed[0m, [33m95 deselected[0m[32m in 1.63s[0m[32m =======================[0m
+=================================== FAILURES ===================================
+[31m[1m________ test_attention_activation_vs_torch[cuda-0.0-False-64-1024-5-2] ________[0m
+
+batch_size = 2, num_heads = 5, queries_len = 1024, inner_dim = 64
+causal = False, dropout = 0.0, device = cuda()
+
+    [0m[37m@pytest[39;49;00m.mark.parametrize([33m"[39;49;00m[33mbatch_size[39;49;00m[33m"[39;49;00m, [[94m2[39;49;00m])[90m[39;49;00m
+    [37m@pytest[39;49;00m.mark.parametrize([33m"[39;49;00m[33mnum_heads[39;49;00m[33m"[39;49;00m, [[94m5[39;49;00m, [94m10[39;49;00m])[90m[39;49;00m
+    [37m@pytest[39;49;00m.mark.parametrize([33m"[39;49;00m[33mqueries_len[39;49;00m[33m"[39;49;00m, [[94m128[39;49;00m, [94m256[39;49;00m, [94m1024[39;49;00m, [94m2048[39;49;00m])[90m[39;49;00m
+    [37m@pytest[39;49;00m.mark.parametrize([33m"[39;49;00m[33minner_dim[39;49;00m[33m"[39;49;00m, [[94m64[39;49;00m, [94m128[39;49;00m, [94m256[39;49;00m])[90m[39;49;00m
+    [37m@pytest[39;49;00m.mark.parametrize([33m"[39;49;00m[33mcausal[39;49;00m[33m"[39;49;00m, [[94mFalse[39;49;00m, [94mTrue[39;49;00m])[90m[39;49;00m
+    [37m@pytest[39;49;00m.mark.parametrize([33m"[39;49;00m[33mdropout[39;49;00m[33m"[39;49;00m, [[94m0.0[39;49;00m]) [90m# 为对比数值必须为0[39;49;00m[90m[39;49;00m
+    [37m@pytest[39;49;00m.mark.parametrize([33m"[39;49;00m[33mdevice[39;49;00m[33m"[39;49;00m, _DEVICES, ids=[[33m"[39;49;00m[33mcpu[39;49;00m[33m"[39;49;00m, [33m"[39;49;00m[33mcuda[39;49;00m[33m"[39;49;00m])[90m[39;49;00m
+    [94mdef[39;49;00m[90m [39;49;00m[92mtest_attention_activation_vs_torch[39;49;00m(batch_size, num_heads, queries_len, inner_dim, causal, dropout, device):[90m[39;49;00m
+        [90m# Skip non-CUDA if using flash attention, but standard attention works on CPU[39;49;00m[90m[39;49;00m
+        [90m# if device == ndl.cpu(): ...[39;49;00m[90m[39;49;00m
+    [90m[39;49;00m
+        np.random.seed([94m19943[39;49;00m)[90m[39;49;00m
+    [90m[39;49;00m
+        [90m# 构造Q, K, V数据 (Match default Needle MultiHeadAttention shape: B, H, L, D)[39;49;00m[90m[39;49;00m
+        q_np = np.random.randn(batch_size, num_heads, queries_len, inner_dim).astype(np.float16)[90m[39;49;00m
+        k_np = np.random.randn(batch_size, num_heads, queries_len, inner_dim).astype(np.float16)[90m[39;49;00m
+        v_np = np.random.randn(batch_size, num_heads, queries_len, inner_dim).astype(np.float16)[90m[39;49;00m
+    [90m[39;49;00m
+        [90m# --- Needle 运行 ---[39;49;00m[90m[39;49;00m
+        [90m# MultiHeadAttention 的输入就是 (B, H, L, D)[39;49;00m[90m[39;49;00m
+        [90m# 它返回 result, probs (或者只有 result，视实现而定)[39;49;00m[90m[39;49;00m
+        [90m# test_attention_activation 中它返回了 result, probs[39;49;00m[90m[39;49;00m
+    [90m[39;49;00m
+        q_ndl = ndl.Tensor(q_np, device=device)[90m[39;49;00m
+        k_ndl = ndl.Tensor(k_np, device=device)[90m[39;49;00m
+        v_ndl = ndl.Tensor(v_np, device=device)[90m[39;49;00m
+    [90m[39;49;00m
+        layer = nn.FlashMutiHeadAttention([90m[39;49;00m
+            dropout=dropout, causal=causal, device=device, dtype=[33m"[39;49;00m[33mfloat16[39;49;00m[33m"[39;49;00m)[90m[39;49;00m
+    [90m[39;49;00m
+        result_ndl = layer(q_ndl, k_ndl, v_ndl) [90m# 这里假设输入 Q=K=V 测试 self-attention[39;49;00m[90m[39;49;00m
+        [90m# 注意：上面的原始测试中只传了 q, q, q。为了通过测试我们最好也只传 q_ndl[39;49;00m[90m[39;49;00m
+        [90m# 但为了更通用的对比，我们可以稍微修改成传入 distinct Q, K, V[39;49;00m[90m[39;49;00m
+    [90m[39;49;00m
+        [90m# 按照原始 test_attention_activation 逻辑重写：[39;49;00m[90m[39;49;00m
+        [90m# result_ndl, probs_ndl = layer(q_ndl, k_ndl, v_ndl)[39;49;00m[90m[39;49;00m
+    [90m[39;49;00m
+        res_ndl_val = result_ndl.numpy()[90m[39;49;00m
+    [90m[39;49;00m
+        [90m# --- PyTorch 运行 ---[39;49;00m[90m[39;49;00m
+        [90m# PyTorch 的 scaled_dot_product_attention 默认期望 (Batch, Num_Heads, Seq_Len, Head_Dim)[39;49;00m[90m[39;49;00m
+        [90m# 正好也是 (B, H, L, D)[39;49;00m[90m[39;49;00m
+    [90m[39;49;00m
+        q_torch = torch.from_numpy(q_np).to([33m"[39;49;00m[33mcuda[39;49;00m[33m"[39;49;00m [94mif[39;49;00m device == ndl.cuda() [94melse[39;49;00m [33m"[39;49;00m[33mcpu[39;49;00m[33m"[39;49;00m)[90m[39;49;00m
+        k_torch = torch.from_numpy(k_np).to([33m"[39;49;00m[33mcuda[39;49;00m[33m"[39;49;00m [94mif[39;49;00m device == ndl.cuda() [94melse[39;49;00m [33m"[39;49;00m[33mcpu[39;49;00m[33m"[39;49;00m)[90m[39;49;00m
+        v_torch = torch.from_numpy(v_np).to([33m"[39;49;00m[33mcuda[39;49;00m[33m"[39;49;00m [94mif[39;49;00m device == ndl.cuda() [94melse[39;49;00m [33m"[39;49;00m[33mcpu[39;49;00m[33m"[39;49;00m)[90m[39;49;00m
+    [90m[39;49;00m
+        out_torch = torch.nn.functional.scaled_dot_product_attention([90m[39;49;00m
+            q_torch, k_torch, v_torch,[90m[39;49;00m
+            attn_mask=[94mNone[39;49;00m,[90m[39;49;00m
+            dropout_p=dropout,[90m[39;49;00m
+            is_causal=causal[90m[39;49;00m
+        )[90m[39;49;00m
+        [96mprint[39;49;00m(out_torch.dtype)[90m[39;49;00m
+        res_torch_val = out_torch.cpu().numpy()[90m[39;49;00m
+    [90m[39;49;00m
+        [90m# --- 对比 ---[39;49;00m[90m[39;49;00m
+>       np.testing.assert_allclose(res_ndl_val, res_torch_val, atol=[94m1e-2[39;49;00m, rtol=[94m1e-2[39;49;00m)[90m[39;49;00m
+[1m[31mE       AssertionError: [0m
+[1m[31mE       Not equal to tolerance rtol=0.01, atol=0.01[0m
+[1m[31mE       [0m
+[1m[31mE       Mismatched elements: 156973 / 655360 (24%)[0m
+[1m[31mE       Max absolute difference among violations: 0.2493[0m
+[1m[31mE       Max relative difference among violations: 15880.[0m
+[1m[31mE        ACTUAL: array([[[[-0.010796,  0.1605  ,  0.00915 , ..., -0.02614 ,  0.03427 ,[0m
+[1m[31mE                  0.0628  ],[0m
+[1m[31mE                [ 0.0265  ,  0.08514 , -0.0239  , ...,  0.02231 , -0.01613 ,...[0m
+[1m[31mE        DESIRED: array([[[[-1.0803e-02,  1.6052e-01,  9.1476e-03, ..., -3.5980e-02,[0m
+[1m[31mE                  3.2715e-02,  6.0669e-02],[0m
+[1m[31mE                [ 2.6505e-02,  8.5205e-02, -2.3911e-02, ...,  7.4844e-03,...[0m
+
+batch_size = 2
+causal     = False
+device     = cuda()
+dropout    = 0.0
+inner_dim  = 64
+k_ndl      = needle.Tensor([[[[-0.2098    0.3604    2.135    ...  0.599     1.246     0.6978  ]
+   [ 0.3198    0.1471    0.9224   ....  -0.3965   ...  0.568     0.5356   -1.041   ]
+   [ 0.99     -1.6875   -0.57     ... -1.397    -1.636    -0.5337  ]]]])
+k_np       = array([[[[-0.2098  ,  0.3604  ,  2.135   , ...,  0.599   ,  1.246   ,
+           0.6978  ],
+         [ 0.3198  ,  0.14...9    , -1.6875  , -0.57    , ..., -1.397   , -1.636   ,
+          -0.5337  ]]]], shape=(2, 5, 1024, 64), dtype=float16)
+k_torch    = tensor([[[[-0.2098,  0.3604,  2.1348,  ...,  0.5991,  1.2461,  0.6978],
+          [ 0.3198,  0.1471,  0.9224,  ..., -1...          [ 0.9902, -1.6875, -0.5698,  ..., -1.3975, -1.6357, -0.5337]]]],
+       device='cuda:0', dtype=torch.float16)
+layer      = <needle.nn.nn_flashtransformer.FlashMutiHeadAttention object at 0x7fd1db157760>
+num_heads  = 5
+out_torch  = tensor([[[[-1.0803e-02,  1.6052e-01,  9.1476e-03,  ..., -3.5980e-02,
+            3.2715e-02,  6.0669e-02],
+          [...317e-02, -1.1292e-02,  ...,  4.4769e-02,
+           -5.1849e-02,  6.1584e-02]]]], device='cuda:0', dtype=torch.float16)
+q_ndl      = needle.Tensor([[[[-8.0414e-03  6.3135e-01  2.2520e+00 ... -9.7314e-01  8.5156e-01
+     5.3711e-01]
+   [-2.3010e-01 -3....1  3.1494e-01
+    -8.9209e-01]
+   [-7.7441e-01  2.5757e-01  2.2241e-01 ...  1.5420e+00  1.3623e-01
+    -2.2285e+00]]]])
+q_np       = array([[[[-8.0414e-03,  6.3135e-01,  2.2520e+00, ..., -9.7314e-01,
+           8.5156e-01,  5.3711e-01],
+         [-2.3...01,  2.2241e-01, ...,  1.5420e+00,
+           1.3623e-01, -2.2285e+00]]]],
+      shape=(2, 5, 1024, 64), dtype=float16)
+q_torch    = tensor([[[[-8.0414e-03,  6.3135e-01,  2.2520e+00,  ..., -9.7314e-01,
+            8.5156e-01,  5.3711e-01],
+          [...757e-01,  2.2241e-01,  ...,  1.5420e+00,
+            1.3623e-01, -2.2285e+00]]]], device='cuda:0', dtype=torch.float16)
+queries_len = 1024
+res_ndl_val = array([[[[-0.010796 ,  0.1605   ,  0.00915  , ..., -0.02614  ,
+           0.03427  ,  0.0628   ],
+         [ 0.0265   ...789   , -0.00833  , ...,  0.03836  ,
+          -0.03845  ,  0.05203  ]]]],
+      shape=(2, 5, 1024, 64), dtype=float16)
+res_torch_val = array([[[[-1.0803e-02,  1.6052e-01,  9.1476e-03, ..., -3.5980e-02,
+           3.2715e-02,  6.0669e-02],
+         [ 2.6...02, -1.1292e-02, ...,  4.4769e-02,
+          -5.1849e-02,  6.1584e-02]]]],
+      shape=(2, 5, 1024, 64), dtype=float16)
+result_ndl = needle.Tensor([[[[-0.010796   0.1605     0.00915   ... -0.02614    0.03427
+     0.0628   ]
+   [ 0.0265     0.08514   -.....  0.01354   -0.02678
+     0.02005  ]
+   [-0.01765   -0.0789    -0.00833   ...  0.03836   -0.03845
+     0.05203  ]]]])
+v_ndl      = needle.Tensor([[[[-3.0777e-02  1.9458e-01  2.4622e-01 ...  1.3203e+00  1.6748e-01
+     1.2471e+00]
+   [-5.8301e-01  3....1 -9.1943e-01
+     4.9561e-01]
+   [ 7.8027e-01 -7.0114e-03 -8.9600e-01 ...  1.3369e+00  1.0186e+00
+     8.7646e-02]]]])
+v_np       = array([[[[-3.0777e-02,  1.9458e-01,  2.4622e-01, ...,  1.3203e+00,
+           1.6748e-01,  1.2471e+00],
+         [-5.8...03, -8.9600e-01, ...,  1.3369e+00,
+           1.0186e+00,  8.7646e-02]]]],
+      shape=(2, 5, 1024, 64), dtype=float16)
+v_torch    = tensor([[[[-3.0777e-02,  1.9458e-01,  2.4622e-01,  ...,  1.3203e+00,
+            1.6748e-01,  1.2471e+00],
+          [...114e-03, -8.9600e-01,  ...,  1.3369e+00,
+            1.0186e+00,  8.7646e-02]]]], device='cuda:0', dtype=torch.float16)
+
+[1m[31mtests/project/test_flashattention.py[0m:114: AssertionError
+[36m[1m=========================== short test summary info ============================[0m
+[31mFAILED[0m tests/project/test_flashattention.py::[1mtest_attention_activation_vs_torch[cuda-0.0-False-64-1024-5-2][0m - AssertionError: 
+[31m======================= [31m[1m1 failed[0m, [33m95 deselected[0m[31m in 1.94s[0m[31m =======================[0m
