@@ -61,6 +61,63 @@ CUTLASS_DEVICE void convert_type_out(Tensor<Engine, Layout> const &tensor, Tenso
     for (int i = 0; i < size(frag); ++i) { out_frg[i] = convert_op(frag[i]); }
 }
 
+template<typename FragmentP, typename FragmentO>
+CUTLASS_DEVICE void online_softmax(FragmentP& rP, float* row_max, float* row_sum, FragmentO& rO) 
+{
+  float row_max_new[2] = {row_max[0], row_max[1]};
+
+  //get local thread row max
+  for(size_t i = 0; i < size<2>(rP); i++) {
+    for(size_t j = 0; j < size<0, 0>(rP); j++) {
+      row_max_new[0] = rP(make_coord(j, 0), 0, i) > row_max_new[0] ? rP(make_coord(j, 0), 0, i) : row_max_new[0];
+      row_max_new[1] = rP(make_coord(j, 1), 0, i) > row_max_new[1] ? rP(make_coord(j, 1), 0, i) : row_max_new[1];
+    }
+  }
+  //shuffle  every thread get the max value of the row
+  unsigned mask = __activemask();
+  row_max_new[0] = fmaxf(row_max_new[0], __shfl_xor_sync(mask, row_max_new[0], 1, 4));
+  row_max_new[0] = fmaxf(row_max_new[0], __shfl_xor_sync(mask, row_max_new[0], 2, 4));
+  row_max_new[1] = fmaxf(row_max_new[1], __shfl_xor_sync(mask, row_max_new[1], 1, 4));
+  row_max_new[1] = fmaxf(row_max_new[1], __shfl_xor_sync(mask, row_max_new[1], 2, 4));
+
+  float alph[2];
+  alph[0] = expf(row_max[0] - row_max_new[0]);
+  alph[1] = expf(row_max[1] - row_max_new[1]);
+
+  //get local thread sum
+  float row_sum_new[2] = {0.0f, 0.0f};
+  for(size_t i = 0; i < size<2>(rP); i++) {
+    for(size_t j = 0; j < size<0, 0>(rP); j++) {
+      rP(make_coord(j, 0), 0, i) = expf(rP(make_coord(j, 0), 0, i) - row_max_new[0]);
+      rP(make_coord(j, 1), 0, i) = expf(rP(make_coord(j, 1), 0, i) - row_max_new[1]);
+      row_sum_new[0] += rP(make_coord(j, 0), 0, i);
+      row_sum_new[1] += rP(make_coord(j, 1), 0, i);
+
+    }
+  }
+  //shuffle to get the sum of the row
+  row_sum_new[0] += __shfl_xor_sync(mask, row_sum_new[0], 1, 4);
+  row_sum_new[0] += __shfl_xor_sync(mask, row_sum_new[0], 2, 4);
+  row_sum_new[1] += __shfl_xor_sync(mask, row_sum_new[1], 1, 4);
+  row_sum_new[1] += __shfl_xor_sync(mask, row_sum_new[1], 2, 4);
+
+  //update rO
+  for(size_t i = 0; i < size<2>(rO); i++) {
+    for(size_t j = 0; j < size<0, 0>(rO); j++) {
+      rO(make_coord(j, 0), 0, i) = rO(make_coord(j, 0), 0, i) * alph[0];
+      rO(make_coord(j, 1), 0, i) = rO(make_coord(j, 1), 0, i) * alph[1];
+    }
+  }
+
+  //update row_max and row_sum
+  row_sum[0] = row_sum_new[0] + row_sum[0] * alph[0];
+  row_sum[1] = row_sum_new[1] + row_sum[1] * alph[1];
+  row_max[0] = row_max_new[0];
+  row_max[1] = row_max_new[1];
+
+  return;
+
+}
 template <typename GLayoutQ, typename GLayoutK, typename GLayoutV, typename GLayoutO,
           typename SLayoutQ, typename SLayoutK, typename SLayoutV, typename SLayoutO,
           typename TileG2SQ, typename TileG2SK, typename TileG2SV,
@@ -91,9 +148,11 @@ __global__ void flash_attention_kernel(const scalar_t* q, const scalar_t* k, con
   smem_offset += size(sOL) * sizeof(float);
   float* pShmem = reinterpret_cast<float*>(smem + smem_offset);
   smem_offset += size<0>(sQL) * size<0>(sKL) * sizeof(float);
-  float* row_maxShmem = reinterpret_cast<float*>(smem + smem_offset);
-  smem_offset += size<0>(sQL) * sizeof(float);
-  float* row_sumShmem = reinterpret_cast<float*>(smem + smem_offset);
+  // float* row_maxShmem = reinterpret_cast<float*>(smem + smem_offset);
+  // smem_offset += size<0>(sQL) * sizeof(float);
+  // float* row_sumShmem = reinterpret_cast<float*>(smem + smem_offset);
+  float row_max[2] = {-FLT_MAX, -FLT_MAX};
+  float row_sum[2] = {0.0f, 0.0f};
 
   for (int i = threadIdx.x; i < size(sOL); i += blockDim.x) {
     oShmem[i] = 0.0f;
@@ -131,18 +190,18 @@ __global__ void flash_attention_kernel(const scalar_t* q, const scalar_t* k, con
   Tensor sP = make_tensor(make_smem_ptr<float>(pShmem),
                           make_shape(size<0>(sQL), size<0>(sKL)));  // (bN, bK)
 
-  Tensor row_max = make_tensor(make_smem_ptr<float>(row_maxShmem),
-                               make_shape(size<0>(sQL)));           // (bN)
+  // Tensor row_max = make_tensor(make_smem_ptr<float>(row_maxShmem),
+  //                              make_shape(size<0>(sQL)));           // (bN)
 
-  Tensor row_sum = make_tensor(make_smem_ptr<float>(row_sumShmem),
-                               make_shape(size<0>(sQL)));           // (bN)
+  // Tensor row_sum = make_tensor(make_smem_ptr<float>(row_sumShmem),
+  //                              make_shape(size<0>(sQL)));           // (bN)
 
   // 初始化 row_max / row_sum
-  if (threadIdx.x < size<0>(row_max)) {
-    row_max(threadIdx.x) = -FLT_MAX;
-    row_sum(threadIdx.x) = 0.0f;
-  }
-  __syncthreads();
+  // if (threadIdx.x < size<0>(row_max)) {
+  //   row_max(threadIdx.x) = -FLT_MAX;
+  //   row_sum(threadIdx.x) = 0.0f;
+  // }
+  // __syncthreads();
 
   // load gQ to sQ
   auto g2s_thr_copyQ = g2s_copyQ.get_slice(threadIdx.x);
@@ -173,17 +232,20 @@ __global__ void flash_attention_kernel(const scalar_t* q, const scalar_t* k, con
   auto mma2sV = thr_mma2.partition_B(sV_trans);
   auto mma2sO = thr_mma2.partition_C(sO);   // (MMA, Mma_M, Mma_N)
   // auto mma2rP = thr_mma2.make_fragment_A(mma2sP);   // (MMA, Mma_M, Mma_K)
-  auto mma2rP_float = make_fragment_like<float>(mma2sP);   // (MMA, Mma_M, Mma_K)
+  // auto mma2rP_float = make_fragment_like<float>(mma2sP);   // (MMA, Mma_M, Mma_K)
   auto mma2rP = make_fragment_like<scalar_t>(mma2sP);
   auto mma2rV = thr_mma2.make_fragment_B(mma2sV);
   auto mma2rO = thr_mma2.make_fragment_C(mma2sO);
+  clear(mma2rO);
 
   if(thread0()) {
     print(mma1sP); print("\n");
     print(mma1rP); print("\n");
     print(mma2sP); print("\n");
-    print(mma2rP_float); print("\n");
+    // print(mma2rP_float); print("\n");
     print(mma2rP); print("\n");
+    print(mma2sO); print("\n");
+    print(mma2rO); print("\n");
     print_latex(mma1); print("\n");
     print_latex(mma2); print("\n");
   }
@@ -226,58 +288,66 @@ __global__ void flash_attention_kernel(const scalar_t* q, const scalar_t* k, con
 
     gemm(mma1, mma1rQ, mma1rK, mma1rP);
 
-    copy(mma1rP, mma1sP);
-    __syncthreads();
+    // copy(mma1rP, mma1sP);
+    //__syncthreads();
 
-    int row = threadIdx.x;
-    if (row < size<0>(sP)) {
-      float row_max_new = row_max(row);
+    online_softmax(mma1rP, row_max, row_sum, mma2rO);
+    // int row = threadIdx.x;
+    // if (row < size<0>(sP)) {
+    //   float row_max_new = row_max(row);
 
-      for (int n = 0; n < size<1>(sP); ++n) {
-        row_max_new = max(row_max_new, sP(row, n));
-      }
+    //   for (int n = 0; n < size<1>(sP); ++n) {
+    //     row_max_new = max(row_max_new, sP(row, n));
+    //   }
 
-      float sum = 0.0f;
-      float alpha = exp(row_max(row) - row_max_new);
+    //   float sum = 0.0f;
+    //   float alpha = exp(row_max(row) - row_max_new);
 
-      for (int d = 0; d < size<1>(sO); ++d) {
-        sO(row, d) = sO(row, d) * alpha;
-      }
+    //   for (int d = 0; d < size<1>(sO); ++d) {
+    //     sO(row, d) = sO(row, d) * alpha;
+    //   }
 
-      for (int n = 0; n < size<1>(sP); ++n) {
-        sP(row, n) = exp(sP(row, n) - row_max_new);
-        sum += sP(row, n);
-        //sO(row, n) = sO(row, n) * offset;
-      }
+    //   for (int n = 0; n < size<1>(sP); ++n) {
+    //     sP(row, n) = exp(sP(row, n) - row_max_new);
+    //     sum += sP(row, n);
+    //     //sO(row, n) = sO(row, n) * offset;
+    //   }
 
-      row_sum(row) = row_sum(row) * alpha + sum;
-      row_max(row) = row_max_new;
-    }
+    //   row_sum(row) = row_sum(row) * alpha + sum;
+    //   row_max(row) = row_max_new;
+    // }
 
     cp_async_wait<0>();
     __syncthreads();
 
-    copy(mma2sP, mma2rP_float);
-    convert_type_out(mma2rP_float, mma2rP);
+    //copy(mma2sP, mma2rP_float);
+    convert_type_out(mma1rP, mma2rP);
     copy(mma2sV, mma2rV);
 
 
-    copy(mma2sO, mma2rO);
+    //copy(mma2sO, mma2rO);
 
     gemm(mma2, mma2rP, mma2rV, mma2rO);
-    copy(mma2rO, mma2sO);
-    __syncthreads();
+    //copy(mma2rO, mma2sO);
+    //__syncthreads();
   }
   // final scale: O /= row_sum
-  if (threadIdx.x < size<0>(sO)) {
-    int row = threadIdx.x;
-    float denom = row_sum(row);
-    if (denom > 0.0f) {
-      for (int d = 0; d < size<1>(sO); ++d) {
-        sO(row, d) = sO(row, d) / denom;
-      }
+  // if (threadIdx.x < size<0>(sO)) {
+  //   int row = threadIdx.x;
+  //   float denom = row_sum(row);
+  //   if (denom > 0.0f) {
+  //     for (int d = 0; d < size<1>(sO); ++d) {
+  //       sO(row, d) = sO(row, d) / denom;
+  //     }
+  //   }
+  // }
+  for(size_t i = 0; i < size<2>(mma2rO); i++) {
+    for(size_t j = 0; j < size<0, 0>(mma2rO); j++) {
+      mma2rO(make_coord(j, 0), 0, i) = mma2rO(make_coord(j, 0), 0, i) / row_sum[0];
+      mma2rO(make_coord(j, 1), 0, i) = mma2rO(make_coord(j, 1), 0, i) / row_sum[1];
     }
   }
+  copy(mma2rO, mma2sO);
   __syncthreads();
 
 for (int i = threadIdx.x; i < size(sO); i += blockDim.x) {
