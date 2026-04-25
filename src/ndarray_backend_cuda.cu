@@ -74,7 +74,7 @@ CUTLASS_DEVICE void online_softmax(FragmentP& rP, float* row_max, float* row_sum
     }
   }
   //shuffle  every thread get the max value of the row
-  unsigned mask = __activemask();
+  unsigned mask = unsigned(-1);
   row_max_new[0] = fmaxf(row_max_new[0], __shfl_xor_sync(mask, row_max_new[0], 1, 4));
   row_max_new[0] = fmaxf(row_max_new[0], __shfl_xor_sync(mask, row_max_new[0], 2, 4));
   row_max_new[1] = fmaxf(row_max_new[1], __shfl_xor_sync(mask, row_max_new[1], 1, 4));
@@ -299,7 +299,7 @@ __global__ void flash_attention_kernel(const scalar_t* q, const scalar_t* k, con
 
     // copy(mma1rP, mma1sP);
     //__syncthreads();
-    if(t == 0) {
+    if(i == 0) {
       online_softmax<true>(mma1rP, row_max, row_sum, mma2rO);
     } else {
       online_softmax<false>(mma1rP, row_max, row_sum, mma2rO);
@@ -342,7 +342,7 @@ __global__ void flash_attention_kernel(const scalar_t* q, const scalar_t* k, con
 
     gemm(mma2, mma2rP, mma2rV, mma2rO);
     //copy(mma2rO, mma2sO);
-    //__syncthreads();
+    __syncthreads();
   }
   // final scale: O /= row_sum
   // if (threadIdx.x < size<0>(sO)) {

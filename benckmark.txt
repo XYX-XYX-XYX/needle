@@ -1,2 +1,3 @@
 FMA navie kernel Average Latency: 9.648 ms. Approx. TFLOPS: 2.671
 using mma Average Latency: 5.338 ms Approx. TFLOPS: 4.827
+optimze without intermidiate share memory tensor sP: Approx. TFLOPS: 17.98
