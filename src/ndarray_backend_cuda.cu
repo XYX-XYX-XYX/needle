@@ -130,12 +130,14 @@ CUTLASS_DEVICE void online_softmax(FragmentP& rP, float* row_max, float* row_sum
 template <typename GLayoutQ, typename GLayoutK, typename GLayoutV, typename GLayoutO,
           typename SLayoutQ, typename SLayoutK, typename SLayoutV, typename SLayoutO,
           typename TileG2SQ, typename TileG2SK, typename TileG2SV,
+          typename AtomS2RQ, typename AtomS2RK, typename AtomS2RV,
           typename MMA1, typename MMA2>
 __global__ void flash_attention_kernel(const scalar_t* q, const scalar_t* k, const scalar_t* v,
                                        scalar_t* o, float dropout, bool causal,
                                        GLayoutQ gQL, GLayoutK gKL, GLayoutV gVL, GLayoutO gOL,
                                        SLayoutQ sQL, SLayoutK sKL, SLayoutV sVL, SLayoutO sOL,
                                        TileG2SQ g2s_copyQ, TileG2SK g2s_copyK, TileG2SV g2s_copyV,
+                                       AtomS2RQ s2r_copyQ_atom, AtomS2RK s2r_copyK_atom, AtomS2RV s2r_copyV_atom,
                                        MMA1 mma1, MMA2 mma2)
 {
 
@@ -157,16 +159,10 @@ __global__ void flash_attention_kernel(const scalar_t* q, const scalar_t* k, con
   smem_offset += size(sOL) * sizeof(float);
   float* pShmem = reinterpret_cast<float*>(smem + smem_offset);
   smem_offset += size<0>(sQL) * size<0>(sKL) * sizeof(float);
-  // float* row_maxShmem = reinterpret_cast<float*>(smem + smem_offset);
-  // smem_offset += size<0>(sQL) * sizeof(float);
-  // float* row_sumShmem = reinterpret_cast<float*>(smem + smem_offset);
   float row_max[2] = {-FLT_MAX, -FLT_MAX};
   float row_sum[2] = {0.0f, 0.0f};
 
-  // for (int i = threadIdx.x; i < size(sOL); i += blockDim.x) {
-  //   oShmem[i] = 0.0f;
-  // }
-  // __syncthreads();
+  
 
   Tensor Q = make_tensor(make_gmem_ptr<scalar_t>(q), gQL);   // (batch_size, num_heads, q_len, head_dim)
   Tensor K = make_tensor(make_gmem_ptr<scalar_t>(k), gKL);   // (batch_size, num_heads, kv_len, head_dim)
@@ -199,18 +195,7 @@ __global__ void flash_attention_kernel(const scalar_t* q, const scalar_t* k, con
   Tensor sP = make_tensor(make_smem_ptr<float>(pShmem),
                           make_shape(size<0>(sQL), size<0>(sKL)));  // (bN, bK)
 
-  // Tensor row_max = make_tensor(make_smem_ptr<float>(row_maxShmem),
-  //                              make_shape(size<0>(sQL)));           // (bN)
 
-  // Tensor row_sum = make_tensor(make_smem_ptr<float>(row_sumShmem),
-  //                              make_shape(size<0>(sQL)));           // (bN)
-
-  // 初始化 row_max / row_sum
-  // if (threadIdx.x < size<0>(row_max)) {
-  //   row_max(threadIdx.x) = -FLT_MAX;
-  //   row_sum(threadIdx.x) = 0.0f;
-  // }
-  // __syncthreads();
 
   // load gQ to sQ
   auto g2s_thr_copyQ = g2s_copyQ.get_slice(threadIdx.x);
@@ -247,16 +232,35 @@ __global__ void flash_attention_kernel(const scalar_t* q, const scalar_t* k, con
   auto mma2rO = thr_mma2.make_fragment_C(mma2sO);
   clear(mma2rO);
 
+  // load sQ to rQ
+  auto s2r_tiled_copyQ = make_tiled_copy_A(s2r_copyQ_atom, mma1);
+  auto s2r_thr_copyQ = s2r_tiled_copyQ.get_slice(threadIdx.x);
+  auto tQsQ_s2r = s2r_thr_copyQ.partition_S(sQ);
+  auto tQrQ_s2r = s2r_thr_copyQ.retile_D(mma1rQ);
+  //load sK to rK
+  auto s2r_tiled_copyK = make_tiled_copy_B(s2r_copyK_atom, mma1);
+  auto s2r_thr_copyK = s2r_tiled_copyK.get_slice(threadIdx.x);
+  auto tKsK_s2r = s2r_thr_copyK.partition_S(sK);
+  auto tKrK_s2r = s2r_thr_copyK.retile_D(mma1rK);
+  //load sV to rV
+  auto s2r_tiled_copyV = make_tiled_copy_B(s2r_copyV_atom, mma2);
+  auto s2r_thr_copyV = s2r_tiled_copyV.get_slice(threadIdx.x);
+  auto tVsV_s2r = s2r_thr_copyV.partition_S(sV_trans);
+  auto tVrV_s2r = s2r_thr_copyV.retile_D(mma2rV);
+
   if(thread0()) {
-    print(mma1sP); print("\n");
-    print(mma1rP); print("\n");
-    print(mma2sP); print("\n");
-    // print(mma2rP_float); print("\n");
-    print(mma2rP); print("\n");
-    print(mma2sO); print("\n");
-    print(mma2rO); print("\n");
-    print_latex(mma1); print("\n");
-    print_latex(mma2); print("\n");
+    // print(mma1sP); print("\n");
+    // print(mma1rP); print("\n");
+    // print(mma2sP); print("\n");
+    // // print(mma2rP_float); print("\n");
+    // print(mma2rP); print("\n");
+    // print(mma2sO); print("\n");
+    // print(mma2rO); print("\n");
+    // print_latex(mma1); print("\n");
+    // print_latex(mma2); print("\n");
+    print_latex(s2r_tiled_copyQ); print("\n");
+    print_latex(s2r_tiled_copyK); print("\n");
+    print_latex(s2r_tiled_copyV); print("\n");
   }
 
   // load gQ to sQ and load sQ to register
@@ -264,7 +268,7 @@ __global__ void flash_attention_kernel(const scalar_t* q, const scalar_t* k, con
   cp_async_fence();
   cp_async_wait<0>();
   __syncthreads();
-  copy(mma1sQ, mma1rQ);
+  copy(s2r_tiled_copyQ, tQsQ_s2r, tQrQ_s2r);
   float sm_scale = rsqrtf(size<1>(sQ));  // 1 / sqrt(head_dim)
 
   for (size_t t = 0; t < size(mma1rQ); ++t) {
@@ -292,68 +296,33 @@ __global__ void flash_attention_kernel(const scalar_t* q, const scalar_t* k, con
     cp_async_wait<1>();
     __syncthreads();
     // load sK to register
-    copy(mma1sK, mma1rK);
+    copy(s2r_tiled_copyK, tKsK_s2r, tKrK_s2r);
 
 
     gemm(mma1, mma1rQ, mma1rK, mma1rP);
 
-    // copy(mma1rP, mma1sP);
-    //__syncthreads();
+
     if(i == 0) {
       online_softmax<true>(mma1rP, row_max, row_sum, mma2rO);
     } else {
       online_softmax<false>(mma1rP, row_max, row_sum, mma2rO);
     }
 
-    // int row = threadIdx.x;
-    // if (row < size<0>(sP)) {
-    //   float row_max_new = row_max(row);
-
-    //   for (int n = 0; n < size<1>(sP); ++n) {
-    //     row_max_new = max(row_max_new, sP(row, n));
-    //   }
-
-    //   float sum = 0.0f;
-    //   float alpha = exp(row_max(row) - row_max_new);
-
-    //   for (int d = 0; d < size<1>(sO); ++d) {
-    //     sO(row, d) = sO(row, d) * alpha;
-    //   }
-
-    //   for (int n = 0; n < size<1>(sP); ++n) {
-    //     sP(row, n) = exp(sP(row, n) - row_max_new);
-    //     sum += sP(row, n);
-    //     //sO(row, n) = sO(row, n) * offset;
-    //   }
-
-    //   row_sum(row) = row_sum(row) * alpha + sum;
-    //   row_max(row) = row_max_new;
-    // }
+ 
 
     cp_async_wait<0>();
     __syncthreads();
 
-    //copy(mma2sP, mma2rP_float);
     convert_type_out(mma1rP, mma2rP);
-    copy(mma2sV, mma2rV);
+    copy(s2r_tiled_copyV, tVsV_s2r, tVrV_s2r);
 
 
-    //copy(mma2sO, mma2rO);
 
     gemm(mma2, mma2rP, mma2rV, mma2rO);
     //copy(mma2rO, mma2sO);
     __syncthreads();
   }
-  // final scale: O /= row_sum
-  // if (threadIdx.x < size<0>(sO)) {
-  //   int row = threadIdx.x;
-  //   float denom = row_sum(row);
-  //   if (denom > 0.0f) {
-  //     for (int d = 0; d < size<1>(sO); ++d) {
-  //       sO(row, d) = sO(row, d) / denom;
-  //     }
-  //   }
-  // }
+
   for(size_t i = 0; i < size<2>(mma2rO); i++) {
     for(size_t j = 0; j < size<0, 0>(mma2rO); j++) {
       mma2rO(make_coord(j, 0), 0, i) = mma2rO(make_coord(j, 0), 0, i) / row_sum[0];
@@ -422,7 +391,9 @@ void FlashAttentionForward(const CudaArray& q, const CudaArray& k, const CudaArr
                                   Layout<Shape<_1, _8>>{});
 
   //copy share to register using navie copy 
-  
+  auto s2r_copyQ_atom = Copy_Atom<SM75_U32x2_LDSM_N, scalar_t>{};
+  auto s2r_copyK_atom = Copy_Atom<SM75_U32x1_LDSM_N, scalar_t>{};
+  auto s2r_copyV_atom = Copy_Atom<SM75_U16x2_LDSM_T, scalar_t>{};
   //mma1
   auto mma1 = make_tiled_mma(MMA_Atom<SM80_16x8x8_F32F16F16F32_TN>{},
                                 Layout<Shape<_4, _1, _1>>{},
@@ -430,10 +401,6 @@ void FlashAttentionForward(const CudaArray& q, const CudaArray& k, const CudaArr
   auto mma2 = make_tiled_mma(MMA_Atom<SM80_16x8x8_F32F16F16F32_TN>{},
                                 Layout<Shape<_4, _1, _1>>{},
                                 Tile<_64, _8, _8>{});
-  // auto mma1 = make_tiled_mma(UniversalFMA<scalar_t, scalar_t, float>{},
-  //                               Layout<Shape<_16, _8, _1>>{});
-  // auto mma2 = make_tiled_mma(UniversalFMA<scalar_t, scalar_t, float>{},
-  //                               Layout<Shape<_16, _8, _1>>{});
   size_t smem_elems_half = (bN + bK + bK) * head_dim;
   size_t smem_elems_float = bN * 2 + bN * bK + bN * head_dim; // sQ, sK, sV, sO, sP, row_max, row_sum
   size_t smem_half_bytes = smem_elems_half * sizeof(scalar_t);
@@ -452,6 +419,9 @@ void FlashAttentionForward(const CudaArray& q, const CudaArray& k, const CudaArr
   using TileG2SQ_t  = std::decay_t<decltype(g2s_copyQ)>;
   using TileG2SK_t  = std::decay_t<decltype(g2s_copyK)>;
   using TileG2SV_t  = std::decay_t<decltype(g2s_copyV)>;
+  using AtomS2RQ_t = std::decay_t<decltype(s2r_copyQ_atom)>;
+  using AtomS2RK_t = std::decay_t<decltype(s2r_copyK_atom)>;
+  using AtomS2RV_t = std::decay_t<decltype(s2r_copyV_atom)>;
   using MMA1_t      = std::decay_t<decltype(mma1)>;
   using MMA2_t      = std::decay_t<decltype(mma2)>;
 
@@ -466,6 +436,7 @@ void FlashAttentionForward(const CudaArray& q, const CudaArray& k, const CudaArr
       GLayoutQ_t, GLayoutK_t, GLayoutV_t, GLayoutO_t,
       SLayoutQ_t, SLayoutK_t, SLayoutV_t, SLayoutO_t,
       TileG2SQ_t, TileG2SK_t, TileG2SV_t,
+      AtomS2RQ_t, AtomS2RK_t, AtomS2RV_t,
       MMA1_t, MMA2_t
   );
 
@@ -474,6 +445,7 @@ void FlashAttentionForward(const CudaArray& q, const CudaArray& k, const CudaArr
           GLayoutQ_t, GLayoutK_t, GLayoutV_t, GLayoutO_t,
           SLayoutQ_t, SLayoutK_t, SLayoutV_t, SLayoutO_t,
           TileG2SQ_t, TileG2SK_t, TileG2SV_t,
+          AtomS2RQ_t, AtomS2RK_t, AtomS2RV_t,
           MMA1_t, MMA2_t
       >;
 
@@ -487,6 +459,7 @@ void FlashAttentionForward(const CudaArray& q, const CudaArray& k, const CudaArr
                                           gQ, gK, gV, gO,
                                           sQ, sK, sV, sO,
                                           g2s_copyQ, g2s_copyK, g2s_copyV,
+                                          s2r_copyQ_atom, s2r_copyK_atom, s2r_copyV_atom,
                                           mma1, mma2);
 
 
