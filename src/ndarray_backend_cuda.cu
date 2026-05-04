@@ -391,7 +391,7 @@ void FlashAttentionForward(const CudaArray& q, const CudaArray& k, const CudaArr
                                   Layout<Shape<_1, _8>>{});
 
   //copy share to register using navie copy 
-  auto s2r_copyQ_atom = Copy_Atom<SM75_U32x2_LDSM_N, scalar_t>{};
+  auto s2r_copyQ_atom = Copy_Atom<SM75_U32x1_LDSM_N, scalar_t>{};
   auto s2r_copyK_atom = Copy_Atom<SM75_U32x1_LDSM_N, scalar_t>{};
   auto s2r_copyV_atom = Copy_Atom<SM75_U16x2_LDSM_T, scalar_t>{};
   //mma1
