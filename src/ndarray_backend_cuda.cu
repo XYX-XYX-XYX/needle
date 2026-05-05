@@ -258,9 +258,9 @@ __global__ void flash_attention_kernel(const scalar_t* q, const scalar_t* k, con
     // print(mma2rO); print("\n");
     // print_latex(mma1); print("\n");
     // print_latex(mma2); print("\n");
-    print_latex(s2r_tiled_copyQ); print("\n");
-    print_latex(s2r_tiled_copyK); print("\n");
-    print_latex(s2r_tiled_copyV); print("\n");
+    // print_latex(s2r_tiled_copyQ); print("\n");
+    // print_latex(s2r_tiled_copyK); print("\n");
+    // print_latex(s2r_tiled_copyV); print("\n");
   }
 
   // load gQ to sQ and load sQ to register
@@ -271,6 +271,7 @@ __global__ void flash_attention_kernel(const scalar_t* q, const scalar_t* k, con
   copy(s2r_tiled_copyQ, tQsQ_s2r, tQrQ_s2r);
   float sm_scale = rsqrtf(size<1>(sQ));  // 1 / sqrt(head_dim)
 
+  #pragma unroll
   for (size_t t = 0; t < size(mma1rQ); ++t) {
     //mma1rQ(t) = to_tf32(mma1rQ(t)* sm_scale);
     mma1rQ(t) = mma1rQ(t) * sm_scale;
@@ -402,7 +403,7 @@ void FlashAttentionForward(const CudaArray& q, const CudaArray& k, const CudaArr
                                 Layout<Shape<_4, _1, _1>>{},
                                 Tile<_64, _8, _8>{});
   size_t smem_elems_half = (bN + bK + bK) * head_dim;
-  size_t smem_elems_float = bN * 2 + bN * bK + bN * head_dim; // sQ, sK, sV, sO, sP, row_max, row_sum
+  size_t smem_elems_float = bN * bK + bN * head_dim; // sQ, sK, sV, sO, sP
   size_t smem_half_bytes = smem_elems_half * sizeof(scalar_t);
   size_t smem_bytes = ((smem_half_bytes + alignof(float) - 1) / alignof(float)) * alignof(float)
                     + smem_elems_float * sizeof(float);
