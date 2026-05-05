@@ -4,6 +4,7 @@ cmake_policy(SET CMP0146 OLD)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 option(NEEDLE_USE_FLASHATTN_STUB "Build FlashAttention stub hooks into the CUDA backend" ON)
+option(NEEDLE_CUDA_LINEINFO "Compile CUDA backend with source line info for profiling" ON)
 set(NEEDLE_CUTLASS_PATH "${CMAKE_CURRENT_SOURCE_DIR}/3rdparty/cutlass" CACHE PATH "Path to the CUTLASS checkout")
 
 # find correct version of Python
@@ -85,8 +86,14 @@ if(CUDA_FOUND)
     CUDA_SELECT_NVCC_ARCH_FLAGS(ARCH_FLAGS 8.0)
   endif()
 
+  set(NEEDLE_CUDA_OPTIONS ${ARCH_FLAGS})
+  if(NEEDLE_CUDA_LINEINFO)
+    list(APPEND NEEDLE_CUDA_OPTIONS -lineinfo)
+    message(STATUS "Compiling CUDA backend with -lineinfo")
+  endif()
+
   # set arch flags properly
-  CUDA_ADD_LIBRARY(ndarray_backend_cuda MODULE src/ndarray_backend_cuda.cu OPTIONS ${ARCH_FLAGS})
+  CUDA_ADD_LIBRARY(ndarray_backend_cuda MODULE src/ndarray_backend_cuda.cu OPTIONS ${NEEDLE_CUDA_OPTIONS})
 
   if(NEEDLE_ENABLE_FLASHATTN_STUB)
     target_compile_definitions(ndarray_backend_cuda PRIVATE NEEDLE_ENABLE_FLASHATTN_STUB=1)
