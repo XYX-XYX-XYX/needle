@@ -266,9 +266,9 @@ __global__ void flash_attention_kernel(const scalar_t* q, const scalar_t* k, con
     // print(mma2rO); print("\n");
     // print_latex(mma1); print("\n");
     // print_latex(mma2); print("\n");
-    // print_latex(s2r_tiled_copyQ); print("\n");
-    // print_latex(s2r_tiled_copyK); print("\n");
-    // print_latex(s2r_tiled_copyV); print("\n");
+    print_latex(s2r_tiled_copyQ); print("\n");
+    print_latex(s2r_tiled_copyK); print("\n");
+    print_latex(s2r_tiled_copyV); print("\n");
   }
 
   // load gQ to sQ and load sQ to register
@@ -381,9 +381,12 @@ void FlashAttentionForward(const CudaArray& q, const CudaArray& k, const CudaArr
   auto bN = Int<64>{};
   auto bK = Int<64>{};
 
-  auto sQ = make_layout(make_shape(bN,  _64{}), LayoutRight{});
-  auto sK = make_layout(make_shape(bK,  _64{}), LayoutRight{});
+  //auto sQ = make_layout(make_shape(bN,  _64{}), LayoutRight{});
+  auto sQ = composition(Swizzle<3,3,3>{}, make_layout(make_shape(bN,  _64{}), LayoutRight{}));
+  //auto sK = make_layout(make_shape(bK,  _64{}), LayoutRight{});
+  auto sK = composition(Swizzle<3,3,3>{}, make_layout(make_shape(bK,  _64{}), LayoutRight{}));
   auto sV = make_layout(make_shape(bK,  _64{}), LayoutRight{});
+  //auto sV_trans = make_layout(make_shape(_64{}, bK), LayoutLeft{});
   auto sO = make_layout(make_shape(bN,  _64{}), LayoutRight{});
 
   //copy gobal to share memory
