@@ -131,14 +131,16 @@ template <typename GLayoutQ, typename GLayoutK, typename GLayoutV, typename GLay
           typename SLayoutQ, typename SLayoutK, typename SLayoutV, typename SLayoutO,
           typename TileG2SQ, typename TileG2SK, typename TileG2SV,
           typename AtomS2RQ, typename AtomS2RK, typename AtomS2RV,
-          typename MMA1, typename MMA2>
+          typename MMA1, typename MMA2, 
+          typename TiledS2GO>
 __global__ void flash_attention_kernel(const scalar_t* q, const scalar_t* k, const scalar_t* v,
                                        scalar_t* o, float dropout, bool causal,
                                        GLayoutQ gQL, GLayoutK gKL, GLayoutV gVL, GLayoutO gOL,
                                        SLayoutQ sQL, SLayoutK sKL, SLayoutV sVL, SLayoutO sOL,
                                        TileG2SQ g2s_copyQ, TileG2SK g2s_copyK, TileG2SV g2s_copyV,
                                        AtomS2RQ s2r_copyQ_atom, AtomS2RK s2r_copyK_atom, AtomS2RV s2r_copyV_atom,
-                                       MMA1 mma1, MMA2 mma2)
+                                       MMA1 mma1, MMA2 mma2, 
+                                       TiledS2GO s2g_copyO)
 {
 
   extern __shared__ __align__(sizeof(float)) unsigned char smem[];
@@ -190,7 +192,7 @@ __global__ void flash_attention_kernel(const scalar_t* q, const scalar_t* k, con
   Tensor sV_trans  = make_tensor(make_smem_ptr<scalar_t>(vShmem), 
                                 make_layout(make_shape(size<1>(sVL), size<0>(sVL)), 
                                 make_stride(stride<1>(sVL), stride<0>(sVL))));   // (head_dim, bK)
-  Tensor sO = make_tensor(make_smem_ptr<float>(oShmem), sOL);   // (bN, head_dim)
+  Tensor sO = make_tensor(make_smem_ptr<scalar_t>(oShmem), sOL);   // (bN, head_dim)
 
   Tensor sP = make_tensor(make_smem_ptr<float>(pShmem),
                           make_shape(size<0>(sQL), size<0>(sKL)));  // (bN, bK)
@@ -230,6 +232,7 @@ __global__ void flash_attention_kernel(const scalar_t* q, const scalar_t* k, con
   auto mma2rP = make_fragment_like<scalar_t>(mma2sP);
   auto mma2rV = thr_mma2.make_fragment_B(mma2sV);
   auto mma2rO = thr_mma2.make_fragment_C(mma2sO);
+  // auto mma2rO_half = make_fragment_like<scalar_t>(mma2sO);
   clear(mma2rO);
 
   // load sQ to rQ
@@ -247,6 +250,11 @@ __global__ void flash_attention_kernel(const scalar_t* q, const scalar_t* k, con
   auto s2r_thr_copyV = s2r_tiled_copyV.get_slice(threadIdx.x);
   auto tVsV_s2r = s2r_thr_copyV.partition_S(sV_trans);
   auto tVrV_s2r = s2r_thr_copyV.retile_D(mma2rV);
+
+  //load sO to gO
+  auto g2s_thr_copyO = s2g_copyO.get_slice(threadIdx.x);
+  auto tOsO = g2s_thr_copyO.partition_S(sO);
+  auto tOgO = g2s_thr_copyO.partition_D(gO);
 
   if(thread0()) {
     // print(mma1sP); print("\n");
@@ -333,9 +341,7 @@ __global__ void flash_attention_kernel(const scalar_t* q, const scalar_t* k, con
   copy(mma2rO, mma2sO);
   __syncthreads();
 
-for (int i = threadIdx.x; i < size(sO); i += blockDim.x) {
-    gO(i) = sO(i);
-}
+  copy(s2g_copyO, tOsO, tOgO);
   return;
 }
 
@@ -391,7 +397,7 @@ void FlashAttentionForward(const CudaArray& q, const CudaArray& k, const CudaArr
                                   Layout<Shape<_16, _8>, Stride<_8, _1>>{},
                                   Layout<Shape<_1, _8>>{});
 
-  //copy share to register using navie copy 
+  //copy share to register using ldmatrix copy 
   auto s2r_copyQ_atom = Copy_Atom<SM75_U32x1_LDSM_N, scalar_t>{};
   auto s2r_copyK_atom = Copy_Atom<SM75_U32x1_LDSM_N, scalar_t>{};
   auto s2r_copyV_atom = Copy_Atom<SM75_U16x2_LDSM_T, scalar_t>{};
@@ -402,8 +408,13 @@ void FlashAttentionForward(const CudaArray& q, const CudaArray& k, const CudaArr
   auto mma2 = make_tiled_mma(MMA_Atom<SM80_16x8x8_F32F16F16F32_TN>{},
                                 Layout<Shape<_4, _1, _1>>{},
                                 Tile<_64, _8, _8>{});
-  size_t smem_elems_half = (bN + bK + bK) * head_dim;
-  size_t smem_elems_float = bN * bK + bN * head_dim; // sQ, sK, sV, sO, sP
+  //copy share o to register using unversial copy uint128
+  auto s2g_copyO_atom = Copy_Atom<UniversalCopy<uint128_t>, scalar_t>{};
+  auto s2g_copyO = make_tiled_copy(s2g_copyO_atom, 
+                                  Layout<Shape<_16,_8>, Stride<_8, _1>>{},
+                                  Layout<Shape<_1, _8>>{});
+  size_t smem_elems_half = (bN + bK + bK + bN) * head_dim;
+  size_t smem_elems_float = bN * bK ; // sQ, sK, sV, sO, sP
   size_t smem_half_bytes = smem_elems_half * sizeof(scalar_t);
   size_t smem_bytes = ((smem_half_bytes + alignof(float) - 1) / alignof(float)) * alignof(float)
                     + smem_elems_float * sizeof(float);
@@ -425,6 +436,7 @@ void FlashAttentionForward(const CudaArray& q, const CudaArray& k, const CudaArr
   using AtomS2RV_t = std::decay_t<decltype(s2r_copyV_atom)>;
   using MMA1_t      = std::decay_t<decltype(mma1)>;
   using MMA2_t      = std::decay_t<decltype(mma2)>;
+  using TiledS2GO_t = std::decay_t<decltype(s2g_copyO)>;
 
   dim3 block(128);
   // assum q_len % 16 == 0
@@ -438,7 +450,8 @@ void FlashAttentionForward(const CudaArray& q, const CudaArray& k, const CudaArr
       SLayoutQ_t, SLayoutK_t, SLayoutV_t, SLayoutO_t,
       TileG2SQ_t, TileG2SK_t, TileG2SV_t,
       AtomS2RQ_t, AtomS2RK_t, AtomS2RV_t,
-      MMA1_t, MMA2_t
+      MMA1_t, MMA2_t, 
+      TiledS2GO_t
   );
 
   Kernel_t kernel_ptr =
@@ -447,7 +460,8 @@ void FlashAttentionForward(const CudaArray& q, const CudaArray& k, const CudaArr
           SLayoutQ_t, SLayoutK_t, SLayoutV_t, SLayoutO_t,
           TileG2SQ_t, TileG2SK_t, TileG2SV_t,
           AtomS2RQ_t, AtomS2RK_t, AtomS2RV_t,
-          MMA1_t, MMA2_t
+          MMA1_t, MMA2_t, 
+          TiledS2GO_t
       >;
 
   cudaFuncSetAttribute(
@@ -461,7 +475,8 @@ void FlashAttentionForward(const CudaArray& q, const CudaArray& k, const CudaArr
                                           sQ, sK, sV, sO,
                                           g2s_copyQ, g2s_copyK, g2s_copyV,
                                           s2r_copyQ_atom, s2r_copyK_atom, s2r_copyV_atom,
-                                          mma1, mma2);
+                                          mma1, mma2,
+                                          s2g_copyO);
 
 
   return;
