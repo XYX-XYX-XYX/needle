@@ -128,7 +128,7 @@ CUTLASS_DEVICE void online_softmax(FragmentP& rP, float* row_max, float* row_sum
 
 }
 template <typename GLayoutQ, typename GLayoutK, typename GLayoutV, typename GLayoutO,
-          typename SLayoutQ, typename SLayoutK, typename SLayoutV, typename SLayoutO,
+          typename SLayoutQ, typename SLayoutK, typename SLayoutV, typename SLayoutO, typename SLayoutVTrans_t,
           typename TileG2SQ, typename TileG2SK, typename TileG2SV,
           typename AtomS2RQ, typename AtomS2RK, typename AtomS2RV,
           typename MMA1, typename MMA2, 
@@ -136,7 +136,7 @@ template <typename GLayoutQ, typename GLayoutK, typename GLayoutV, typename GLay
 __global__ void flash_attention_kernel(const scalar_t* q, const scalar_t* k, const scalar_t* v,
                                        scalar_t* o, float dropout, bool causal,
                                        GLayoutQ gQL, GLayoutK gKL, GLayoutV gVL, GLayoutO gOL,
-                                       SLayoutQ sQL, SLayoutK sKL, SLayoutV sVL, SLayoutO sOL,
+                                       SLayoutQ sQL, SLayoutK sKL, SLayoutV sVL, SLayoutO sOL, SLayoutVTrans_t sVTransL,
                                        TileG2SQ g2s_copyQ, TileG2SK g2s_copyK, TileG2SV g2s_copyV,
                                        AtomS2RQ s2r_copyQ_atom, AtomS2RK s2r_copyK_atom, AtomS2RV s2r_copyV_atom,
                                        MMA1 mma1, MMA2 mma2, 
@@ -189,9 +189,7 @@ __global__ void flash_attention_kernel(const scalar_t* q, const scalar_t* k, con
   Tensor sQ = make_tensor(make_smem_ptr<scalar_t>(qShmem), sQL);   // (bN, head_dim)
   Tensor sK = make_tensor(make_smem_ptr<scalar_t>(kShmem), sKL);   // (bK, head_dim)
   Tensor sV = make_tensor(make_smem_ptr<scalar_t>(vShmem), sVL);   // (bK, head_dim)
-  Tensor sV_trans  = make_tensor(make_smem_ptr<scalar_t>(vShmem), 
-                                make_layout(make_shape(size<1>(sVL), size<0>(sVL)), 
-                                make_stride(stride<1>(sVL), stride<0>(sVL))));   // (head_dim, bK)
+  Tensor sV_trans  = make_tensor(make_smem_ptr<scalar_t>(vShmem), sVTransL);   // (head_dim, bK)
   Tensor sO = make_tensor(make_smem_ptr<scalar_t>(oShmem), sOL);   // (bN, head_dim)
 
   Tensor sP = make_tensor(make_smem_ptr<float>(pShmem),
@@ -381,9 +379,14 @@ void FlashAttentionForward(const CudaArray& q, const CudaArray& k, const CudaArr
   auto bN = Int<64>{};
   auto bK = Int<64>{};
 
-  auto sQ = make_layout(make_shape(bN,  _64{}), LayoutRight{});
-  auto sK = make_layout(make_shape(bK,  _64{}), LayoutRight{});
-  auto sV = make_layout(make_shape(bK,  _64{}), LayoutRight{});
+  //auto sQ = make_layout(make_shape(bN,  _64{}), LayoutRight{});
+  auto sQ = composition(Swizzle<3,3,3>{}, make_layout(make_shape(bN,  _64{}), LayoutRight{}));
+  //auto sK = make_layout(make_shape(bK,  _64{}), LayoutRight{});
+  auto sK = composition(Swizzle<3,3,3>{}, make_layout(make_shape(bK,  _64{}), LayoutRight{}));
+  //auto sV = make_layout(make_shape(bK,  _64{}), LayoutRight{});
+  auto sV = composition(Swizzle<3,3,3>{}, make_layout(make_shape(bK, _64{}), LayoutRight{}));
+  auto sV_trans = composition(Swizzle<3,3,3>{}, make_layout(make_shape(_64{}, bK), LayoutLeft{}));
+  //auto sV_trans = make_layout(make_shape(_64{}, bK), LayoutLeft{});
   auto sO = make_layout(make_shape(bN,  _64{}), LayoutRight{});
 
   //copy gobal to share memory
@@ -427,6 +430,7 @@ void FlashAttentionForward(const CudaArray& q, const CudaArray& k, const CudaArr
   using SLayoutQ_t  = std::decay_t<decltype(sQ)>;
   using SLayoutK_t  = std::decay_t<decltype(sK)>;
   using SLayoutV_t  = std::decay_t<decltype(sV)>;
+  using SLayoutVTrans_t = std::decay_t<decltype(sV_trans)>;
   using SLayoutO_t  = std::decay_t<decltype(sO)>;
   using TileG2SQ_t  = std::decay_t<decltype(g2s_copyQ)>;
   using TileG2SK_t  = std::decay_t<decltype(g2s_copyK)>;
@@ -447,7 +451,7 @@ void FlashAttentionForward(const CudaArray& q, const CudaArray& k, const CudaArr
       const scalar_t*, const scalar_t*, const scalar_t*,
       scalar_t*, float, bool,
       GLayoutQ_t, GLayoutK_t, GLayoutV_t, GLayoutO_t,
-      SLayoutQ_t, SLayoutK_t, SLayoutV_t, SLayoutO_t,
+      SLayoutQ_t, SLayoutK_t, SLayoutV_t, SLayoutO_t, SLayoutVTrans_t,
       TileG2SQ_t, TileG2SK_t, TileG2SV_t,
       AtomS2RQ_t, AtomS2RK_t, AtomS2RV_t,
       MMA1_t, MMA2_t, 
@@ -457,7 +461,7 @@ void FlashAttentionForward(const CudaArray& q, const CudaArray& k, const CudaArr
   Kernel_t kernel_ptr =
       flash_attention_kernel<
           GLayoutQ_t, GLayoutK_t, GLayoutV_t, GLayoutO_t,
-          SLayoutQ_t, SLayoutK_t, SLayoutV_t, SLayoutO_t,
+          SLayoutQ_t, SLayoutK_t, SLayoutV_t, SLayoutO_t, SLayoutVTrans_t,
           TileG2SQ_t, TileG2SK_t, TileG2SV_t,
           AtomS2RQ_t, AtomS2RK_t, AtomS2RV_t,
           MMA1_t, MMA2_t, 
@@ -472,7 +476,7 @@ void FlashAttentionForward(const CudaArray& q, const CudaArray& k, const CudaArr
 
   kernel_ptr<<<grid, block, smem_bytes>>>(q.ptr, k.ptr, v.ptr, out->ptr, dropout, causal,
                                           gQ, gK, gV, gO,
-                                          sQ, sK, sV, sO,
+                                          sQ, sK, sV, sO, sV_trans,
                                           g2s_copyQ, g2s_copyK, g2s_copyV,
                                           s2r_copyQ_atom, s2r_copyK_atom, s2r_copyV_atom,
                                           mma1, mma2,
