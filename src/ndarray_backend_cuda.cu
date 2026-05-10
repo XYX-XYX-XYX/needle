@@ -159,8 +159,8 @@ __global__ void flash_attention_kernel(const scalar_t* q, const scalar_t* k, con
   smem_offset = align_up(smem_offset, alignof(float));
   float* oShmem = reinterpret_cast<float*>(smem + smem_offset);
   smem_offset += size(sOL) * sizeof(float);
-  float* pShmem = reinterpret_cast<float*>(smem + smem_offset);
-  smem_offset += size<0>(sQL) * size<0>(sKL) * sizeof(float);
+  // float* pShmem = reinterpret_cast<float*>(smem + smem_offset);
+  // smem_offset += size<0>(sQL) * size<0>(sKL) * sizeof(float);
   float row_max[2] = {-FLT_MAX, -FLT_MAX};
   float row_sum[2] = {0.0f, 0.0f};
 
@@ -192,8 +192,9 @@ __global__ void flash_attention_kernel(const scalar_t* q, const scalar_t* k, con
   Tensor sV_trans  = make_tensor(make_smem_ptr<scalar_t>(vShmem), sVTransL);   // (head_dim, bK)
   Tensor sO = make_tensor(make_smem_ptr<scalar_t>(oShmem), sOL);   // (bN, head_dim)
 
-  Tensor sP = make_tensor(make_smem_ptr<float>(pShmem),
-                          make_shape(size<0>(sQL), size<0>(sKL)));  // (bN, bK)
+  // Tensor sP = make_tensor(make_smem_ptr<float>(pShmem),
+  //                         make_shape(size<0>(sQL), size<0>(sKL)));  // (bN, bK)
+  auto sP = make_coord_tensor(make_layout(make_shape(size<0>(sQL), size<0>(sKL))));  // (bN, bK)
 
 
 
@@ -272,8 +273,17 @@ __global__ void flash_attention_kernel(const scalar_t* q, const scalar_t* k, con
   // load gQ to sQ and load sQ to register
   copy(g2s_copyQ, tQgQ, tQsQ);
   cp_async_fence();
-  cp_async_wait<0>();
-  __syncthreads();
+  //cp_async_wait<0>();
+  //__syncthreads();
+  auto gK = local_tile(K(batch_id, head_id, _, _),
+                       make_tile(size<0>(sKL), size<1>(sKL)),
+                       make_coord(0, 0)); // (bK, head_dim)
+  auto tKgK = g2s_thr_copyK.partition_S(gK);
+  copy(g2s_copyK, tKgK, tKsK);  
+  cp_async_fence();
+  cp_async_wait<1>();
+  __syncthreads();  
+
   copy(s2r_tiled_copyQ, tQsQ_s2r, tQrQ_s2r);
   float sm_scale = rsqrtf(size<1>(sQ));  // 1 / sqrt(head_dim)
 
@@ -283,15 +293,18 @@ __global__ void flash_attention_kernel(const scalar_t* q, const scalar_t* k, con
     mma1rQ(t) = mma1rQ(t) * sm_scale;
   }
 
+  
+
   for (size_t i = 0; i < size<2>(gKL) / size<0>(sKL); ++i) {
     clear(mma1rP);
-    // load gK to sK and load gV to sV
-    auto gK = local_tile(K(batch_id, head_id, _, _),
-                       make_tile(size<0>(sKL), size<1>(sKL)),
-                       make_coord(i, 0));                    // (bK, head_dim)
-    auto tKgK = g2s_thr_copyK.partition_S(gK);
-    copy(g2s_copyK, tKgK, tKsK);
-    cp_async_fence();
+
+    // // load gK to sK and load gV to sV
+    // gK = local_tile(K(batch_id, head_id, _, _),
+    //                    make_tile(size<0>(sKL), size<1>(sKL)),
+    //                    make_coord(i, 0));                    // (bK, head_dim)
+    // tKgK = g2s_thr_copyK.partition_S(gK);
+    // copy(g2s_copyK, tKgK, tKsK);
+    // cp_async_fence();
 
     auto gV = local_tile(V(batch_id, head_id, _, _),
                        make_tile(size<0>(sVL), size<1>(sVL)),
@@ -304,7 +317,14 @@ __global__ void flash_attention_kernel(const scalar_t* q, const scalar_t* k, con
     __syncthreads();
     // load sK to register
     copy(s2r_tiled_copyK, tKsK_s2r, tKrK_s2r);
-
+    if(i != size<2>(gKL) / size<0>(sKL) - 1) {
+      gK = local_tile(K(batch_id, head_id, _, _),
+                         make_tile(size<0>(sKL), size<1>(sKL)),
+                         make_coord(i + 1, 0));                    // (bK, head_dim)
+      tKgK = g2s_thr_copyK.partition_S(gK);
+      copy(g2s_copyK, tKgK, tKsK);
+      cp_async_fence();
+    }
 
     gemm(mma1, mma1rQ, mma1rK, mma1rP);
 
@@ -314,15 +334,16 @@ __global__ void flash_attention_kernel(const scalar_t* q, const scalar_t* k, con
     } else {
       online_softmax<false>(mma1rP, row_max, row_sum, mma2rO);
     }
-
- 
-
-    cp_async_wait<0>();
+    convert_type_out(mma1rP, mma2rP);
+    
+    if(i != size<2>(gKL) / size<0>(sKL) - 1) {
+      cp_async_wait<1>();
+    } else {
+      cp_async_wait<0>();
+    }
     __syncthreads();
 
-    convert_type_out(mma1rP, mma2rP);
     copy(s2r_tiled_copyV, tVsV_s2r, tVrV_s2r);
-
 
 
     gemm(mma2, mma2rP, mma2rV, mma2rO);
@@ -368,7 +389,7 @@ void FlashAttentionForward(const CudaArray& q, const CudaArray& k, const CudaArr
       << ", dropout=" << dropout
       << ", causal=" << std::boolalpha << causal << ")";
   
-  std::cout << msg.str() << std::endl;
+  // std::cout << msg.str() << std::endl;
 
   using namespace cute;
   auto gQ = make_layout(make_shape(batch_size, num_heads, q_len, _64{}), LayoutRight{});
@@ -390,13 +411,13 @@ void FlashAttentionForward(const CudaArray& q, const CudaArray& k, const CudaArr
   auto sO = make_layout(make_shape(bN,  _64{}), LayoutRight{});
 
   //copy gobal to share memory
-  auto g2s_copyQ = make_tiled_copy(Copy_Atom<SM80_CP_ASYNC_CACHEALWAYS<uint128_t>, scalar_t>{}, 
+  auto g2s_copyQ = make_tiled_copy(Copy_Atom<SM80_CP_ASYNC_CACHEGLOBAL<uint128_t>, scalar_t>{}, 
                                   Layout<Shape<_16, _8>, Stride<_8, _1>>{},
                                   Layout<Shape<_1, _8>>{});
-  auto g2s_copyK = make_tiled_copy(Copy_Atom<SM80_CP_ASYNC_CACHEALWAYS<uint128_t>, scalar_t>{}, 
+  auto g2s_copyK = make_tiled_copy(Copy_Atom<SM80_CP_ASYNC_CACHEGLOBAL<uint128_t>, scalar_t>{}, 
                                   Layout<Shape<_16, _8>, Stride<_8, _1>>{},
                                   Layout<Shape<_1, _8>>{});
-  auto g2s_copyV = make_tiled_copy(Copy_Atom<SM80_CP_ASYNC_CACHEALWAYS<uint128_t>, scalar_t>{}, 
+  auto g2s_copyV = make_tiled_copy(Copy_Atom<SM80_CP_ASYNC_CACHEGLOBAL<uint128_t>, scalar_t>{}, 
                                   Layout<Shape<_16, _8>, Stride<_8, _1>>{},
                                   Layout<Shape<_1, _8>>{});
 
@@ -416,8 +437,8 @@ void FlashAttentionForward(const CudaArray& q, const CudaArray& k, const CudaArr
   auto s2g_copyO = make_tiled_copy(s2g_copyO_atom, 
                                   Layout<Shape<_16,_8>, Stride<_8, _1>>{},
                                   Layout<Shape<_1, _8>>{});
-  size_t smem_elems_half = (bN + bK + bK + bN) * head_dim;
-  size_t smem_elems_float = bN * bK ; // sQ, sK, sV, sO, sP
+  size_t smem_elems_half = (bN + bK + bK) * head_dim;
+  size_t smem_elems_float = bN * head_dim ; // sQ, sK, sV, sO, sP
   size_t smem_half_bytes = smem_elems_half * sizeof(scalar_t);
   size_t smem_bytes = ((smem_half_bytes + alignof(float) - 1) / alignof(float)) * alignof(float)
                     + smem_elems_float * sizeof(float);
