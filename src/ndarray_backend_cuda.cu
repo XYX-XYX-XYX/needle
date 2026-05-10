@@ -46,6 +46,14 @@ struct CudaArray {
 
 using namespace cute;
 
+void CudaCheck(cudaError_t err, const char* context) {
+  if (err != cudaSuccess) {
+    std::ostringstream msg;
+    msg << context << ": " << cudaGetErrorString(err);
+    throw std::runtime_error(msg.str());
+  }
+}
+
 template <typename Engine, typename Layout, typename EngineOut>
 CUTLASS_DEVICE void convert_type_out(Tensor<Engine, Layout> const &tensor, Tensor<EngineOut, Layout> &out) {
     // Somehow if we allocate out inside this function and return it, e2e is slower and the output can be wrong.
@@ -365,10 +373,11 @@ __global__ void flash_attention_kernel(const scalar_t* q, const scalar_t* k, con
   return;
 }
 
-void FlashAttentionForward(const CudaArray& q, const CudaArray& k, const CudaArray& v,
-                          CudaArray* out, size_t batch_size, size_t num_heads,
-                          size_t q_len, size_t kv_len,
-                          size_t head_dim, float dropout, bool causal) {
+void LaunchFlashAttentionForward(const CudaArray& q, const CudaArray& k, const CudaArray& v,
+                                 CudaArray* out, size_t batch_size, size_t num_heads,
+                                 size_t q_len, size_t kv_len,
+                                 size_t head_dim, float dropout, bool causal,
+                                 cudaStream_t stream) {
   (void)sizeof(cutlass::Status);
 
   const size_t q_size = batch_size * num_heads * q_len * head_dim;
@@ -490,22 +499,67 @@ void FlashAttentionForward(const CudaArray& q, const CudaArray& k, const CudaArr
           TiledS2GO_t
       >;
 
-  cudaFuncSetAttribute(
+  CudaCheck(cudaFuncSetAttribute(
       reinterpret_cast<const void*>(kernel_ptr),
       cudaFuncAttributeMaxDynamicSharedMemorySize,
       smem_bytes
-  );
+  ), "cudaFuncSetAttribute for flash attention");
 
-  kernel_ptr<<<grid, block, smem_bytes>>>(q.ptr, k.ptr, v.ptr, out->ptr, dropout, causal,
-                                          gQ, gK, gV, gO,
-                                          sQ, sK, sV, sO, sV_trans,
-                                          g2s_copyQ, g2s_copyK, g2s_copyV,
-                                          s2r_copyQ_atom, s2r_copyK_atom, s2r_copyV_atom,
-                                          mma1, mma2,
-                                          s2g_copyO);
+  kernel_ptr<<<grid, block, smem_bytes, stream>>>(q.ptr, k.ptr, v.ptr, out->ptr, dropout, causal,
+                                                  gQ, gK, gV, gO,
+                                                  sQ, sK, sV, sO, sV_trans,
+                                                  g2s_copyQ, g2s_copyK, g2s_copyV,
+                                                  s2r_copyQ_atom, s2r_copyK_atom, s2r_copyV_atom,
+                                                  mma1, mma2,
+                                                  s2g_copyO);
+  CudaCheck(cudaGetLastError(), "launch flash attention kernel");
 
 
   return;
+}
+
+void FlashAttentionForward(const CudaArray& q, const CudaArray& k, const CudaArray& v,
+                          CudaArray* out, size_t batch_size, size_t num_heads,
+                          size_t q_len, size_t kv_len,
+                          size_t head_dim, float dropout, bool causal) {
+  LaunchFlashAttentionForward(q, k, v, out, batch_size, num_heads, q_len, kv_len,
+                              head_dim, dropout, causal, 0);
+}
+
+float FlashAttentionForwardBenchmark(const CudaArray& q, const CudaArray& k, const CudaArray& v,
+                                     CudaArray* out, size_t batch_size, size_t num_heads,
+                                     size_t q_len, size_t kv_len,
+                                     size_t head_dim, float dropout, bool causal,
+                                     int repeats) {
+  if (repeats <= 0) {
+    throw std::runtime_error("flash attention benchmark repeats must be positive");
+  }
+
+  cudaStream_t stream = 0;
+  cudaEvent_t start;
+  cudaEvent_t stop;
+  CudaCheck(cudaEventCreate(&start), "cudaEventCreate(start)");
+  CudaCheck(cudaEventCreate(&stop), "cudaEventCreate(stop)");
+
+  try {
+    CudaCheck(cudaEventRecord(start, stream), "cudaEventRecord(start)");
+    for (int i = 0; i < repeats; ++i) {
+      LaunchFlashAttentionForward(q, k, v, out, batch_size, num_heads, q_len, kv_len,
+                                  head_dim, dropout, causal, stream);
+    }
+    CudaCheck(cudaEventRecord(stop, stream), "cudaEventRecord(stop)");
+    CudaCheck(cudaEventSynchronize(stop), "cudaEventSynchronize(stop)");
+
+    float elapsed_ms = 0.0f;
+    CudaCheck(cudaEventElapsedTime(&elapsed_ms, start, stop), "cudaEventElapsedTime");
+    CudaCheck(cudaEventDestroy(start), "cudaEventDestroy(start)");
+    CudaCheck(cudaEventDestroy(stop), "cudaEventDestroy(stop)");
+    return elapsed_ms;
+  } catch (...) {
+    cudaEventDestroy(start);
+    cudaEventDestroy(stop);
+    throw;
+  }
 }
 #endif
 
@@ -591,6 +645,7 @@ PYBIND11_MODULE(ndarray_backend_cuda, m) {
 #ifdef NEEDLE_ENABLE_FLASHATTN_STUB
   m.attr("__has_flash_attention_stub__") = true;
   m.def("flash_attention_forward", FlashAttentionForward);
+  m.def("flash_attention_forward_benchmark", FlashAttentionForwardBenchmark);
 #else
   m.attr("__has_flash_attention_stub__") = false;
 #endif
