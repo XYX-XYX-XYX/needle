@@ -46,6 +46,14 @@ struct CudaArray {
 
 using namespace cute;
 
+void CudaCheck(cudaError_t err, const char* context) {
+  if (err != cudaSuccess) {
+    std::ostringstream msg;
+    msg << context << ": " << cudaGetErrorString(err);
+    throw std::runtime_error(msg.str());
+  }
+}
+
 template <typename Engine, typename Layout, typename EngineOut>
 CUTLASS_DEVICE void convert_type_out(Tensor<Engine, Layout> const &tensor, Tensor<EngineOut, Layout> &out) {
     // Somehow if we allocate out inside this function and return it, e2e is slower and the output can be wrong.
@@ -159,8 +167,8 @@ __global__ void flash_attention_kernel(const scalar_t* q, const scalar_t* k, con
   smem_offset = align_up(smem_offset, alignof(float));
   float* oShmem = reinterpret_cast<float*>(smem + smem_offset);
   smem_offset += size(sOL) * sizeof(float);
-  float* pShmem = reinterpret_cast<float*>(smem + smem_offset);
-  smem_offset += size<0>(sQL) * size<0>(sKL) * sizeof(float);
+  // float* pShmem = reinterpret_cast<float*>(smem + smem_offset);
+  // smem_offset += size<0>(sQL) * size<0>(sKL) * sizeof(float);
   float row_max[2] = {-FLT_MAX, -FLT_MAX};
   float row_sum[2] = {0.0f, 0.0f};
 
@@ -192,8 +200,9 @@ __global__ void flash_attention_kernel(const scalar_t* q, const scalar_t* k, con
   Tensor sV_trans  = make_tensor(make_smem_ptr<scalar_t>(vShmem), sVTransL);   // (head_dim, bK)
   Tensor sO = make_tensor(make_smem_ptr<scalar_t>(oShmem), sOL);   // (bN, head_dim)
 
-  Tensor sP = make_tensor(make_smem_ptr<float>(pShmem),
-                          make_shape(size<0>(sQL), size<0>(sKL)));  // (bN, bK)
+  // Tensor sP = make_tensor(make_smem_ptr<float>(pShmem),
+  //                         make_shape(size<0>(sQL), size<0>(sKL)));  // (bN, bK)
+  auto sP = make_coord_tensor(make_layout(make_shape(size<0>(sQL), size<0>(sKL))));  // (bN, bK)
 
 
 
@@ -272,8 +281,17 @@ __global__ void flash_attention_kernel(const scalar_t* q, const scalar_t* k, con
   // load gQ to sQ and load sQ to register
   copy(g2s_copyQ, tQgQ, tQsQ);
   cp_async_fence();
-  cp_async_wait<0>();
-  __syncthreads();
+  //cp_async_wait<0>();
+  //__syncthreads();
+  auto gK = local_tile(K(batch_id, head_id, _, _),
+                       make_tile(size<0>(sKL), size<1>(sKL)),
+                       make_coord(0, 0)); // (bK, head_dim)
+  auto tKgK = g2s_thr_copyK.partition_S(gK);
+  copy(g2s_copyK, tKgK, tKsK);  
+  cp_async_fence();
+  cp_async_wait<1>();
+  __syncthreads();  
+
   copy(s2r_tiled_copyQ, tQsQ_s2r, tQrQ_s2r);
   float sm_scale = rsqrtf(size<1>(sQ));  // 1 / sqrt(head_dim)
 
@@ -283,15 +301,18 @@ __global__ void flash_attention_kernel(const scalar_t* q, const scalar_t* k, con
     mma1rQ(t) = mma1rQ(t) * sm_scale;
   }
 
+  
+
   for (size_t i = 0; i < size<2>(gKL) / size<0>(sKL); ++i) {
     clear(mma1rP);
-    // load gK to sK and load gV to sV
-    auto gK = local_tile(K(batch_id, head_id, _, _),
-                       make_tile(size<0>(sKL), size<1>(sKL)),
-                       make_coord(i, 0));                    // (bK, head_dim)
-    auto tKgK = g2s_thr_copyK.partition_S(gK);
-    copy(g2s_copyK, tKgK, tKsK);
-    cp_async_fence();
+
+    // // load gK to sK and load gV to sV
+    // gK = local_tile(K(batch_id, head_id, _, _),
+    //                    make_tile(size<0>(sKL), size<1>(sKL)),
+    //                    make_coord(i, 0));                    // (bK, head_dim)
+    // tKgK = g2s_thr_copyK.partition_S(gK);
+    // copy(g2s_copyK, tKgK, tKsK);
+    // cp_async_fence();
 
     auto gV = local_tile(V(batch_id, head_id, _, _),
                        make_tile(size<0>(sVL), size<1>(sVL)),
@@ -304,7 +325,15 @@ __global__ void flash_attention_kernel(const scalar_t* q, const scalar_t* k, con
     __syncthreads();
     // load sK to register
     copy(s2r_tiled_copyK, tKsK_s2r, tKrK_s2r);
-
+    __syncthreads();
+    if(i != size<2>(gKL) / size<0>(sKL) - 1) {
+      gK = local_tile(K(batch_id, head_id, _, _),
+                         make_tile(size<0>(sKL), size<1>(sKL)),
+                         make_coord(i + 1, 0));                    // (bK, head_dim)
+      tKgK = g2s_thr_copyK.partition_S(gK);
+      copy(g2s_copyK, tKgK, tKsK);
+      cp_async_fence();
+    }
 
     gemm(mma1, mma1rQ, mma1rK, mma1rP);
 
@@ -314,15 +343,16 @@ __global__ void flash_attention_kernel(const scalar_t* q, const scalar_t* k, con
     } else {
       online_softmax<false>(mma1rP, row_max, row_sum, mma2rO);
     }
-
- 
-
-    cp_async_wait<0>();
+    convert_type_out(mma1rP, mma2rP);
+    
+    if(i != size<2>(gKL) / size<0>(sKL) - 1) {
+      cp_async_wait<1>();
+    } else {
+      cp_async_wait<0>();
+    }
     __syncthreads();
 
-    convert_type_out(mma1rP, mma2rP);
     copy(s2r_tiled_copyV, tVsV_s2r, tVrV_s2r);
-
 
 
     gemm(mma2, mma2rP, mma2rV, mma2rO);
@@ -343,10 +373,11 @@ __global__ void flash_attention_kernel(const scalar_t* q, const scalar_t* k, con
   return;
 }
 
-void FlashAttentionForward(const CudaArray& q, const CudaArray& k, const CudaArray& v,
-                          CudaArray* out, size_t batch_size, size_t num_heads,
-                          size_t q_len, size_t kv_len,
-                          size_t head_dim, float dropout, bool causal) {
+void LaunchFlashAttentionForward(const CudaArray& q, const CudaArray& k, const CudaArray& v,
+                                 CudaArray* out, size_t batch_size, size_t num_heads,
+                                 size_t q_len, size_t kv_len,
+                                 size_t head_dim, float dropout, bool causal,
+                                 cudaStream_t stream) {
   (void)sizeof(cutlass::Status);
 
   const size_t q_size = batch_size * num_heads * q_len * head_dim;
@@ -368,7 +399,7 @@ void FlashAttentionForward(const CudaArray& q, const CudaArray& k, const CudaArr
       << ", dropout=" << dropout
       << ", causal=" << std::boolalpha << causal << ")";
   
-  std::cout << msg.str() << std::endl;
+  // std::cout << msg.str() << std::endl;
 
   using namespace cute;
   auto gQ = make_layout(make_shape(batch_size, num_heads, q_len, _64{}), LayoutRight{});
@@ -390,13 +421,13 @@ void FlashAttentionForward(const CudaArray& q, const CudaArray& k, const CudaArr
   auto sO = make_layout(make_shape(bN,  _64{}), LayoutRight{});
 
   //copy gobal to share memory
-  auto g2s_copyQ = make_tiled_copy(Copy_Atom<SM80_CP_ASYNC_CACHEALWAYS<uint128_t>, scalar_t>{}, 
+  auto g2s_copyQ = make_tiled_copy(Copy_Atom<SM80_CP_ASYNC_CACHEGLOBAL<uint128_t>, scalar_t>{}, 
                                   Layout<Shape<_16, _8>, Stride<_8, _1>>{},
                                   Layout<Shape<_1, _8>>{});
-  auto g2s_copyK = make_tiled_copy(Copy_Atom<SM80_CP_ASYNC_CACHEALWAYS<uint128_t>, scalar_t>{}, 
+  auto g2s_copyK = make_tiled_copy(Copy_Atom<SM80_CP_ASYNC_CACHEGLOBAL<uint128_t>, scalar_t>{}, 
                                   Layout<Shape<_16, _8>, Stride<_8, _1>>{},
                                   Layout<Shape<_1, _8>>{});
-  auto g2s_copyV = make_tiled_copy(Copy_Atom<SM80_CP_ASYNC_CACHEALWAYS<uint128_t>, scalar_t>{}, 
+  auto g2s_copyV = make_tiled_copy(Copy_Atom<SM80_CP_ASYNC_CACHEGLOBAL<uint128_t>, scalar_t>{}, 
                                   Layout<Shape<_16, _8>, Stride<_8, _1>>{},
                                   Layout<Shape<_1, _8>>{});
 
@@ -416,8 +447,8 @@ void FlashAttentionForward(const CudaArray& q, const CudaArray& k, const CudaArr
   auto s2g_copyO = make_tiled_copy(s2g_copyO_atom, 
                                   Layout<Shape<_16,_8>, Stride<_8, _1>>{},
                                   Layout<Shape<_1, _8>>{});
-  size_t smem_elems_half = (bN + bK + bK + bN) * head_dim;
-  size_t smem_elems_float = bN * bK ; // sQ, sK, sV, sO, sP
+  size_t smem_elems_half = (bN + bK + bK) * head_dim;
+  size_t smem_elems_float = bN * head_dim ; // sQ, sK, sV, sO, sP
   size_t smem_half_bytes = smem_elems_half * sizeof(scalar_t);
   size_t smem_bytes = ((smem_half_bytes + alignof(float) - 1) / alignof(float)) * alignof(float)
                     + smem_elems_float * sizeof(float);
@@ -468,22 +499,67 @@ void FlashAttentionForward(const CudaArray& q, const CudaArray& k, const CudaArr
           TiledS2GO_t
       >;
 
-  cudaFuncSetAttribute(
+  CudaCheck(cudaFuncSetAttribute(
       reinterpret_cast<const void*>(kernel_ptr),
       cudaFuncAttributeMaxDynamicSharedMemorySize,
       smem_bytes
-  );
+  ), "cudaFuncSetAttribute for flash attention");
 
-  kernel_ptr<<<grid, block, smem_bytes>>>(q.ptr, k.ptr, v.ptr, out->ptr, dropout, causal,
-                                          gQ, gK, gV, gO,
-                                          sQ, sK, sV, sO, sV_trans,
-                                          g2s_copyQ, g2s_copyK, g2s_copyV,
-                                          s2r_copyQ_atom, s2r_copyK_atom, s2r_copyV_atom,
-                                          mma1, mma2,
-                                          s2g_copyO);
+  kernel_ptr<<<grid, block, smem_bytes, stream>>>(q.ptr, k.ptr, v.ptr, out->ptr, dropout, causal,
+                                                  gQ, gK, gV, gO,
+                                                  sQ, sK, sV, sO, sV_trans,
+                                                  g2s_copyQ, g2s_copyK, g2s_copyV,
+                                                  s2r_copyQ_atom, s2r_copyK_atom, s2r_copyV_atom,
+                                                  mma1, mma2,
+                                                  s2g_copyO);
+  CudaCheck(cudaGetLastError(), "launch flash attention kernel");
 
 
   return;
+}
+
+void FlashAttentionForward(const CudaArray& q, const CudaArray& k, const CudaArray& v,
+                          CudaArray* out, size_t batch_size, size_t num_heads,
+                          size_t q_len, size_t kv_len,
+                          size_t head_dim, float dropout, bool causal) {
+  LaunchFlashAttentionForward(q, k, v, out, batch_size, num_heads, q_len, kv_len,
+                              head_dim, dropout, causal, 0);
+}
+
+float FlashAttentionForwardBenchmark(const CudaArray& q, const CudaArray& k, const CudaArray& v,
+                                     CudaArray* out, size_t batch_size, size_t num_heads,
+                                     size_t q_len, size_t kv_len,
+                                     size_t head_dim, float dropout, bool causal,
+                                     int repeats) {
+  if (repeats <= 0) {
+    throw std::runtime_error("flash attention benchmark repeats must be positive");
+  }
+
+  cudaStream_t stream = 0;
+  cudaEvent_t start;
+  cudaEvent_t stop;
+  CudaCheck(cudaEventCreate(&start), "cudaEventCreate(start)");
+  CudaCheck(cudaEventCreate(&stop), "cudaEventCreate(stop)");
+
+  try {
+    CudaCheck(cudaEventRecord(start, stream), "cudaEventRecord(start)");
+    for (int i = 0; i < repeats; ++i) {
+      LaunchFlashAttentionForward(q, k, v, out, batch_size, num_heads, q_len, kv_len,
+                                  head_dim, dropout, causal, stream);
+    }
+    CudaCheck(cudaEventRecord(stop, stream), "cudaEventRecord(stop)");
+    CudaCheck(cudaEventSynchronize(stop), "cudaEventSynchronize(stop)");
+
+    float elapsed_ms = 0.0f;
+    CudaCheck(cudaEventElapsedTime(&elapsed_ms, start, stop), "cudaEventElapsedTime");
+    CudaCheck(cudaEventDestroy(start), "cudaEventDestroy(start)");
+    CudaCheck(cudaEventDestroy(stop), "cudaEventDestroy(stop)");
+    return elapsed_ms;
+  } catch (...) {
+    cudaEventDestroy(start);
+    cudaEventDestroy(stop);
+    throw;
+  }
 }
 #endif
 
@@ -569,6 +645,7 @@ PYBIND11_MODULE(ndarray_backend_cuda, m) {
 #ifdef NEEDLE_ENABLE_FLASHATTN_STUB
   m.attr("__has_flash_attention_stub__") = true;
   m.def("flash_attention_forward", FlashAttentionForward);
+  m.def("flash_attention_forward_benchmark", FlashAttentionForwardBenchmark);
 #else
   m.attr("__has_flash_attention_stub__") = false;
 #endif
