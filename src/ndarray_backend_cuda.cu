@@ -317,6 +317,7 @@ __global__ void flash_attention_kernel(const scalar_t* q, const scalar_t* k, con
     __syncthreads();
     // load sK to register
     copy(s2r_tiled_copyK, tKsK_s2r, tKrK_s2r);
+    __syncthreads();
     if(i != size<2>(gKL) / size<0>(sKL) - 1) {
       gK = local_tile(K(batch_id, head_id, _, _),
                          make_tile(size<0>(sKL), size<1>(sKL)),
