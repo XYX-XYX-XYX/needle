@@ -439,7 +439,9 @@ void LaunchFlashAttentionForward(const CudaArray& q, const CudaArray& k, const C
                                 Tile<_64, _8, _8>{});
   auto mma2 = make_tiled_mma(MMA_Atom<SM80_16x8x8_F32F16F16F32_TN>{},
                                 Layout<Shape<_4, _1, _1>>{},
-                                Tile<_64, _64, _8>{});
+                                Tile<_64, 
+                                Layout<Shape<_2, _4, _4>, Stride<_1, _4, _8>>,
+                                _8>{});
   //copy share o to register using unversial copy uint128
   auto s2g_copyO_atom = Copy_Atom<UniversalCopy<uint128_t>, scalar_t>{};
   auto s2g_copyO = make_tiled_copy(s2g_copyO_atom, 
