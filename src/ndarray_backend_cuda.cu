@@ -318,7 +318,7 @@ __global__ void flash_attention_kernel(const scalar_t* q, const scalar_t* k, con
     __syncthreads();
     // load sK to register
     copy(s2r_tiled_copyK, tKsK_s2r, tKrK_s2r);
-    //__syncthreads();
+    __syncthreads();//防止sK被下一轮的global to shared 覆盖
 
     //load gV_{i+1} to sV
     if(i != size<2>(gKL) / size<0>(sKL) - 1) {
@@ -361,15 +361,16 @@ __global__ void flash_attention_kernel(const scalar_t* q, const scalar_t* k, con
   row_sum_inv[1] = 1.0f / row_sum[1];
   for(size_t i = 0; i < size<2>(mma2rO); i++) {
     for(size_t j = 0; j < size<0, 0>(mma2rO); j++) {
-      mma2rO(make_coord(j, 0), 0, i) = mma2rO(make_coord(j, 0), 0, i) *row_sum_inv[0];
-      mma2rO(make_coord(j, 1), 0, i) = mma2rO(make_coord(j, 1), 0, i) *row_sum_inv[1];
+      mma2rO(make_coord(j, 0), 0, i) = mma2rO(make_coord(j, 0), 0, i) * row_sum_inv[0];
+      mma2rO(make_coord(j, 1), 0, i) = mma2rO(make_coord(j, 1), 0, i) * row_sum_inv[1];
     }
   }
   
-  copy(mma2rO, mma2gO);
-  //__syncthreads();
+  copy(mma2rO, mma2sO);
+  // copy(mma2rO, mma2gO);
+  __syncthreads();
 
-  //copy(s2g_copyO, tOsO, tOgO);
+  copy(s2g_copyO, tOsO, tOgO);
   return;
 }
 
