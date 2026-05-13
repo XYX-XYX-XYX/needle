@@ -270,8 +270,8 @@ __global__ void flash_attention_kernel(const scalar_t* q, const scalar_t* k, con
     // print(mma2rP); print("\n");
     // print(mma2sO); print("\n");
     // print(mma2rO); print("\n");
-    // print_latex(mma1); print("\n");
-    // print_latex(mma2); print("\n");
+    print_latex(mma1); print("\n");
+    print_latex(mma2); print("\n");
     // print_latex(s2r_tiled_copyQ); print("\n");
     // print_latex(s2r_tiled_copyK); print("\n");
     // print_latex(s2r_tiled_copyV); print("\n");
@@ -439,7 +439,7 @@ void LaunchFlashAttentionForward(const CudaArray& q, const CudaArray& k, const C
                                 Tile<_64, _8, _8>{});
   auto mma2 = make_tiled_mma(MMA_Atom<SM80_16x8x8_F32F16F16F32_TN>{},
                                 Layout<Shape<_4, _1, _1>>{},
-                                Tile<_64, _8, _8>{});
+                                Tile<_64, _64, _8>{});
   //copy share o to register using unversial copy uint128
   auto s2g_copyO_atom = Copy_Atom<UniversalCopy<uint128_t>, scalar_t>{};
   auto s2g_copyO = make_tiled_copy(s2g_copyO_atom, 
