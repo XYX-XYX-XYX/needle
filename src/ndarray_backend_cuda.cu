@@ -238,6 +238,7 @@ __global__ void flash_attention_kernel(const scalar_t* q, const scalar_t* k, con
   auto mma2rP = make_fragment_like<scalar_t>(mma2sP);
   auto mma2rV = thr_mma2.make_fragment_B(mma2sV);
   auto mma2rO = thr_mma2.make_fragment_C(mma2sO);
+  auto mma2gO = thr_mma2.partition_C(gO);
   // auto mma2rO_half = make_fragment_like<scalar_t>(mma2sO);
   clear(mma2rO);
 
@@ -270,11 +271,14 @@ __global__ void flash_attention_kernel(const scalar_t* q, const scalar_t* k, con
     // print(mma2rP); print("\n");
     // print(mma2sO); print("\n");
     // print(mma2rO); print("\n");
-    print_latex(mma1); print("\n");
-    print_latex(mma2); print("\n");
+    // print_latex(mma1); print("\n");
+    // print_latex(mma2); print("\n");
     // print_latex(s2r_tiled_copyQ); print("\n");
     // print_latex(s2r_tiled_copyK); print("\n");
     // print_latex(s2r_tiled_copyV); print("\n");
+    print_latex(mma2gO); print("\n");
+    print_latex(mma2sO); print("\n");
+    print_latex(mma2rO); print("\n");
   }
 
   // load gQ to sQ and load sQ to register
@@ -439,9 +443,7 @@ void LaunchFlashAttentionForward(const CudaArray& q, const CudaArray& k, const C
                                 Tile<_64, _8, _8>{});
   auto mma2 = make_tiled_mma(MMA_Atom<SM80_16x8x8_F32F16F16F32_TN>{},
                                 Layout<Shape<_4, _1, _1>>{},
-                                Tile<_64, 
-                                Layout<Shape<_2, _4, _4>, Stride<_1, _4, _8>>,
-                                _8>{});
+                                Tile<_64, _8, _8>{});
   //copy share o to register using unversial copy uint128
   auto s2g_copyO_atom = Copy_Atom<UniversalCopy<uint128_t>, scalar_t>{};
   auto s2g_copyO = make_tiled_copy(s2g_copyO_atom, 
