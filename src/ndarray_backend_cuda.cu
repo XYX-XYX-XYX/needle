@@ -167,8 +167,7 @@ __global__ void flash_attention_kernel(const scalar_t* q, const scalar_t* k, con
   smem_offset = align_up(smem_offset, alignof(float));
   float* oShmem = reinterpret_cast<float*>(smem + smem_offset);
   smem_offset += size(sOL) * sizeof(float);
-  // float* pShmem = reinterpret_cast<float*>(smem + smem_offset);
-  // smem_offset += size<0>(sQL) * size<0>(sKL) * sizeof(float);
+  
   float row_max[2] = {-FLT_MAX, -FLT_MAX};
   float row_sum[2] = {0.0f, 0.0f};
 
@@ -281,8 +280,8 @@ __global__ void flash_attention_kernel(const scalar_t* q, const scalar_t* k, con
   // load gQ to sQ and load sQ to register
   copy(g2s_copyQ, tQgQ, tQsQ);
   cp_async_fence();
-  //cp_async_wait<0>();
-  //__syncthreads();
+
+  // load gK_0 to sK 
   auto gK = local_tile(K(batch_id, head_id, _, _),
                        make_tile(size<0>(sKL), size<1>(sKL)),
                        make_coord(0, 0)); // (bK, head_dim)
@@ -292,12 +291,12 @@ __global__ void flash_attention_kernel(const scalar_t* q, const scalar_t* k, con
   cp_async_wait<1>();
   __syncthreads();  
 
+  //copy sQ to register 
   copy(s2r_tiled_copyQ, tQsQ_s2r, tQrQ_s2r);
   float sm_scale = rsqrtf(size<1>(sQ));  // 1 / sqrt(head_dim)
 
   #pragma unroll
   for (size_t t = 0; t < size(mma1rQ); ++t) {
-    //mma1rQ(t) = to_tf32(mma1rQ(t)* sm_scale);
     mma1rQ(t) = mma1rQ(t) * sm_scale;
   }
 
@@ -305,14 +304,6 @@ __global__ void flash_attention_kernel(const scalar_t* q, const scalar_t* k, con
 
   for (size_t i = 0; i < size<2>(gKL) / size<0>(sKL); ++i) {
     clear(mma1rP);
-
-    // // load gK to sK and load gV to sV
-    // gK = local_tile(K(batch_id, head_id, _, _),
-    //                    make_tile(size<0>(sKL), size<1>(sKL)),
-    //                    make_coord(i, 0));                    // (bK, head_dim)
-    // tKgK = g2s_thr_copyK.partition_S(gK);
-    // copy(g2s_copyK, tKgK, tKsK);
-    // cp_async_fence();
 
     auto gV = local_tile(V(batch_id, head_id, _, _),
                        make_tile(size<0>(sVL), size<1>(sVL)),
@@ -325,7 +316,9 @@ __global__ void flash_attention_kernel(const scalar_t* q, const scalar_t* k, con
     __syncthreads();
     // load sK to register
     copy(s2r_tiled_copyK, tKsK_s2r, tKrK_s2r);
-    __syncthreads();
+    //__syncthreads();
+
+    //load gV_{i+1} to sV
     if(i != size<2>(gKL) / size<0>(sKL) - 1) {
       gK = local_tile(K(batch_id, head_id, _, _),
                          make_tile(size<0>(sKL), size<1>(sKL)),
@@ -352,6 +345,7 @@ __global__ void flash_attention_kernel(const scalar_t* q, const scalar_t* k, con
     }
     __syncthreads();
 
+    //copy sV to register 
     copy(s2r_tiled_copyV, tVsV_s2r, tVrV_s2r);
 
 
@@ -360,12 +354,16 @@ __global__ void flash_attention_kernel(const scalar_t* q, const scalar_t* k, con
     __syncthreads();
   }
 
+  float row_sum_inv[2];
+  row_sum_inv[0] = 1.0f / row_sum[0];
+  row_sum_inv[1] = 1.0f / row_sum[1];
   for(size_t i = 0; i < size<2>(mma2rO); i++) {
     for(size_t j = 0; j < size<0, 0>(mma2rO); j++) {
-      mma2rO(make_coord(j, 0), 0, i) = mma2rO(make_coord(j, 0), 0, i) / row_sum[0];
-      mma2rO(make_coord(j, 1), 0, i) = mma2rO(make_coord(j, 1), 0, i) / row_sum[1];
+      mma2rO(make_coord(j, 0), 0, i) = mma2rO(make_coord(j, 0), 0, i) *row_sum_inv[0];
+      mma2rO(make_coord(j, 1), 0, i) = mma2rO(make_coord(j, 1), 0, i) *row_sum_inv[1];
     }
   }
+  
   copy(mma2rO, mma2sO);
   __syncthreads();
 
