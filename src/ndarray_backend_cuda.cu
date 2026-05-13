@@ -164,9 +164,7 @@ __global__ void flash_attention_kernel(const scalar_t* q, const scalar_t* k, con
   smem_offset += size(sKL) * sizeof(scalar_t);
   scalar_t* vShmem = reinterpret_cast<scalar_t*>(smem + smem_offset);
   smem_offset += size(sVL) * sizeof(scalar_t);
-  smem_offset = align_up(smem_offset, alignof(float));
-  float* oShmem = reinterpret_cast<float*>(smem + smem_offset);
-  smem_offset += size(sOL) * sizeof(float);
+  scalar_t* oShmem = reinterpret_cast<scalar_t*>(smem + smem_offset);
   
   float row_max[2] = {-FLT_MAX, -FLT_MAX};
   float row_sum[2] = {0.0f, 0.0f};
@@ -263,23 +261,23 @@ __global__ void flash_attention_kernel(const scalar_t* q, const scalar_t* k, con
   auto tOsO = g2s_thr_copyO.partition_S(sO);
   auto tOgO = g2s_thr_copyO.partition_D(gO);
 
-  if(thread0()) {
-    // print(mma1sP); print("\n");
-    // print(mma1rP); print("\n");
-    // print(mma2sP); print("\n");
-    // // print(mma2rP_float); print("\n");
-    // print(mma2rP); print("\n");
-    // print(mma2sO); print("\n");
-    // print(mma2rO); print("\n");
-    // print_latex(mma1); print("\n");
-    // print_latex(mma2); print("\n");
-    // print_latex(s2r_tiled_copyQ); print("\n");
-    // print_latex(s2r_tiled_copyK); print("\n");
-    // print_latex(s2r_tiled_copyV); print("\n");
-    print(mma2gO); print("\n");
-    print(mma2sO); print("\n");
-    print(mma2rO); print("\n");
-  }
+  // if(thread0()) {
+  //   // print(mma1sP); print("\n");
+  //   // print(mma1rP); print("\n");
+  //   // print(mma2sP); print("\n");
+  //   // // print(mma2rP_float); print("\n");
+  //   // print(mma2rP); print("\n");
+  //   // print(mma2sO); print("\n");
+  //   // print(mma2rO); print("\n");
+  //   // print_latex(mma1); print("\n");
+  //   // print_latex(mma2); print("\n");
+  //   // print_latex(s2r_tiled_copyQ); print("\n");
+  //   // print_latex(s2r_tiled_copyK); print("\n");
+  //   // print_latex(s2r_tiled_copyV); print("\n");
+  //   print(mma2gO); print("\n");
+  //   print(mma2sO); print("\n");
+  //   print(mma2rO); print("\n");
+  // }
 
   // load gQ to sQ and load sQ to register
   copy(g2s_copyQ, tQgQ, tQsQ);
@@ -368,10 +366,10 @@ __global__ void flash_attention_kernel(const scalar_t* q, const scalar_t* k, con
     }
   }
   
-  copy(mma2rO, mma2sO);
-  __syncthreads();
+  copy(mma2rO, mma2gO);
+  //__syncthreads();
 
-  copy(s2g_copyO, tOsO, tOgO);
+  //copy(s2g_copyO, tOsO, tOgO);
   return;
 }
 
@@ -449,11 +447,9 @@ void LaunchFlashAttentionForward(const CudaArray& q, const CudaArray& k, const C
   auto s2g_copyO = make_tiled_copy(s2g_copyO_atom, 
                                   Layout<Shape<_16,_8>, Stride<_8, _1>>{},
                                   Layout<Shape<_1, _8>>{});
-  size_t smem_elems_half = (bN + bK + bK) * head_dim;
-  size_t smem_elems_float = bN * head_dim ; // sQ, sK, sV, sO, sP
+  size_t smem_elems_half = (bN + bK + bK + bN) * head_dim;
   size_t smem_half_bytes = smem_elems_half * sizeof(scalar_t);
-  size_t smem_bytes = ((smem_half_bytes + alignof(float) - 1) / alignof(float)) * alignof(float)
-                    + smem_elems_float * sizeof(float);
+  size_t smem_bytes = smem_half_bytes;
 
 
   using GLayoutQ_t  = std::decay_t<decltype(gQ)>;
