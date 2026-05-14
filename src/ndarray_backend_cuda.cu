@@ -423,7 +423,8 @@ void LaunchFlashAttentionForward(const CudaArray& q, const CudaArray& k, const C
   auto sV = composition(Swizzle<3,3,3>{}, make_layout(make_shape(bK, _64{}), LayoutRight{}));
   auto sV_trans = composition(Swizzle<3,3,3>{}, make_layout(make_shape(_64{}, bK), LayoutLeft{}));
   //auto sV_trans = make_layout(make_shape(_64{}, bK), LayoutLeft{});
-  auto sO = make_layout(make_shape(bN,  _64{}), LayoutRight{});
+  //auto sO = make_layout(make_shape(bN,  _64{}), LayoutRight{});
+  auto sO = composition(Swizzle<3,3,3>{}, make_layout(make_shape(bN, _64{}), LayoutRight{}));
 
   //copy gobal to share memory
   auto g2s_copyQ = make_tiled_copy(Copy_Atom<SM80_CP_ASYNC_CACHEGLOBAL<uint128_t>, scalar_t>{}, 
