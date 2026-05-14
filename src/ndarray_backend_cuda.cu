@@ -438,9 +438,9 @@ void LaunchFlashAttentionForward(const CudaArray& q, const CudaArray& k, const C
                                   Layout<Shape<_1, _8>>{});
 
   //copy share to register using ldmatrix copy 
-  auto s2r_copyQ_atom = Copy_Atom<SM75_U32x1_LDSM_N, scalar_t>{};
-  auto s2r_copyK_atom = Copy_Atom<SM75_U32x1_LDSM_N, scalar_t>{};
-  auto s2r_copyV_atom = Copy_Atom<SM75_U16x2_LDSM_T, scalar_t>{};
+  auto s2r_copyQ_atom = Copy_Atom<SM75_U32x4_LDSM_N, scalar_t>{};
+  auto s2r_copyK_atom = Copy_Atom<SM75_U32x4_LDSM_N, scalar_t>{};
+  auto s2r_copyV_atom = Copy_Atom<SM75_U16x8_LDSM_T, scalar_t>{};
   //mma1
   auto mma1 = make_tiled_mma(MMA_Atom<SM80_16x8x16_F32F16F16F32_TN>{},
                                 Layout<Shape<_4, _1, _1>>{},
