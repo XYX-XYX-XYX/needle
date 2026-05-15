@@ -272,6 +272,10 @@ __global__ void flash_attention_kernel(const scalar_t* q, const scalar_t* k, con
   auto tOgO = g2s_thr_copyO.partition_D(gO);
 
   if(thread0()) {
+    print(tKgK); print("\n");
+    print(tKsK); print("\n");
+    print(tKsK_s2r); print("\n");
+    print(tKrK_s2r); print("\n");
     // print(mma1sP); print("\n");
     // print(mma1rP); print("\n");
     // print(mma2sP); print("\n");
@@ -303,6 +307,7 @@ __global__ void flash_attention_kernel(const scalar_t* q, const scalar_t* k, con
   copy(g2s_copyK, tKgK(_, _, _, 0), tKsK(_, _, _, istage));  
   cp_async_fence();
   copy(g2s_copyV, tVgV(_, _, _, 0), tVsV(_, _, _, istage));
+  cp_async_fence();
   istage++;
   cp_async_wait<2>();
   __syncthreads();  
@@ -381,7 +386,7 @@ __global__ void flash_attention_kernel(const scalar_t* q, const scalar_t* k, con
 
     gemm(mma2, mma2rP, mma2rV, mma2rO);
     //copy(mma2rO, mma2sO);
-    // __syncthreads();
+    __syncthreads();
   }
 
   float row_sum_inv[2];
