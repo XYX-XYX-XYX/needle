@@ -185,16 +185,21 @@ __global__ void flash_attention_kernel(const scalar_t* q, const scalar_t* k, con
   auto gQ = local_tile(Q(batch_id, head_id, _, _),
                        make_tile(size<0>(sQL), size<1>(sQL)),
                        make_coord(seq_id, _0{}));               // (bN, head_dim)
-
+  auto gK = local_tile(K(batch_id, head_id, _, _),
+                       make_tile(size<0>(sKL), size<1>(sKL)),
+                       make_coord(_, _0{})); //(bK, head_dim, k)
+  auto gV = local_tile(V(batch_id, head_id, _, _),
+                        make_tile(size<0>(sVL), size<1>(sVL)),
+                        make_coord(_, _0{})); //(bK, head_dim, k)
 
   auto gO = local_tile(O(batch_id, head_id, _, _),
                        make_tile(size<0>(sOL), size<1>(sOL)),
                        make_coord(seq_id, _0{}));               // (bN, head_dim)
 
   Tensor sQ = make_tensor(make_smem_ptr<scalar_t>(qShmem), sQL);   // (bN, head_dim)
-  Tensor sK = make_tensor(make_smem_ptr<scalar_t>(kShmem), sKL);   // (bK, head_dim)
-  Tensor sV = make_tensor(make_smem_ptr<scalar_t>(vShmem), sVL);   // (bK, head_dim)
-  Tensor sV_trans  = make_tensor(make_smem_ptr<scalar_t>(vShmem), sVTransL);   // (head_dim, bK)
+  Tensor sK = make_tensor(make_smem_ptr<scalar_t>(kShmem), sKL);   // (bK, head_dim, kstage)
+  Tensor sV = make_tensor(make_smem_ptr<scalar_t>(vShmem), sVL);   // (bK, head_dim, kstage)
+  Tensor sV_trans  = make_tensor(make_smem_ptr<scalar_t>(vShmem), sVTransL);   // (head_dim, bK, kstage)
   Tensor sO = make_tensor(make_smem_ptr<scalar_t>(oShmem), sOL);   // (bN, head_dim)
 
   // Tensor sP = make_tensor(make_smem_ptr<float>(pShmem),
@@ -210,31 +215,33 @@ __global__ void flash_attention_kernel(const scalar_t* q, const scalar_t* k, con
 
   // load gK to sK
   auto g2s_thr_copyK = g2s_copyK.get_slice(threadIdx.x);
-  auto tKsK = g2s_thr_copyK.partition_D(sK);   // (CPY, CPY_M, CPY_N)
+  auto tKgK = g2s_thr_copyK.partition_S(gK); //(CPY, CPY_M, CPY_N, k)
+  auto tKsK = g2s_thr_copyK.partition_D(sK);   // (CPY, CPY_M, CPY_N, kstage)
 
   // load gV to sV
   auto g2s_thr_copyV = g2s_copyV.get_slice(threadIdx.x);
-  auto tVsV = g2s_thr_copyV.partition_D(sV);   // (CPY, CPY_M, CPY_N)
+  auto tVgV = g2s_thr_copyV.partition_S(gV); //(CPY, CPY_M, CPY_N, k)
+  auto tVsV = g2s_thr_copyV.partition_D(sV);   // (CPY, CPY_M, CPY_N, kstage)
 
   // mma1 and alloc register
   auto thr_mma1 = mma1.get_slice(threadIdx.x);
   auto mma1sQ = thr_mma1.partition_A(sQ);   // (MMA, Mma_M, Mma_K)
-  auto mma1sK = thr_mma1.partition_B(sK);
+  auto mma1sK = thr_mma1.partition_B(sK(_, _, 0));    // (MMA, Mma_N, Mma_K)
   auto mma1sP = thr_mma1.partition_C(sP);   // (MMA, Mma_M, Mma_N)
   auto mma1rQ = thr_mma1.make_fragment_A(mma1sQ);   // (MMA, Mma_M, Mma_K)
-  auto mma1rK = thr_mma1.make_fragment_B(mma1sK);
+  auto mma1rK = thr_mma1.make_fragment_B(mma1sK);   // (MMA, Mma_N, Mma_K)
   auto mma1rP = thr_mma1.make_fragment_C(mma1sP);   // (MMA, Mma_M, Mma_N)
   //clear(mma1rP);
 
   // mma2 and alloc register
   auto thr_mma2 = mma2.get_slice(threadIdx.x);
   auto mma2sP = thr_mma2.partition_A(sP);   // (MMA, Mma_M, Mma_K)
-  auto mma2sV = thr_mma2.partition_B(sV_trans);
+  auto mma2sV = thr_mma2.partition_B(sV_trans(_, _, 0)); //(MMA, Mma_N, Mma_K)
   auto mma2sO = thr_mma2.partition_C(sO);   // (MMA, Mma_M, Mma_N)
   // auto mma2rP = thr_mma2.make_fragment_A(mma2sP);   // (MMA, Mma_M, Mma_K)
   // auto mma2rP_float = make_fragment_like<float>(mma2sP);   // (MMA, Mma_M, Mma_K)
   auto mma2rP = make_fragment_like<scalar_t>(mma2sP);
-  auto mma2rV = thr_mma2.make_fragment_B(mma2sV);
+  auto mma2rV = thr_mma2.make_fragment_B(mma2sV); //(MMA, Mma_N, Mma_K)
   auto mma2rO = thr_mma2.make_fragment_C(mma2sO);
   auto mma2gO = thr_mma2.partition_C(gO);
 
@@ -251,13 +258,13 @@ __global__ void flash_attention_kernel(const scalar_t* q, const scalar_t* k, con
   //load sK to rK
   auto s2r_tiled_copyK = make_tiled_copy_B(s2r_copyK_atom, mma1);
   auto s2r_thr_copyK = s2r_tiled_copyK.get_slice(threadIdx.x);
-  auto tKsK_s2r = s2r_thr_copyK.partition_S(sK);
-  auto tKrK_s2r = s2r_thr_copyK.retile_D(mma1rK);
+  auto tKsK_s2r = s2r_thr_copyK.partition_S(sK); //(CPY, CPY_M, CPY_N, kstage)
+  auto tKrK_s2r = s2r_thr_copyK.retile_D(mma1rK);//(CPY, CPY_M, CPY_N)
   //load sV to rV
   auto s2r_tiled_copyV = make_tiled_copy_B(s2r_copyV_atom, mma2);
   auto s2r_thr_copyV = s2r_tiled_copyV.get_slice(threadIdx.x);
-  auto tVsV_s2r = s2r_thr_copyV.partition_S(sV_trans);
-  auto tVrV_s2r = s2r_thr_copyV.retile_D(mma2rV);
+  auto tVsV_s2r = s2r_thr_copyV.partition_S(sV_trans);//(CPY, CPY_M, CPY_N, kstage)
+  auto tVrV_s2r = s2r_thr_copyV.retile_D(mma2rV);//(CPY, CPY_M, CPY_N)
 
   //load sO to gO
   auto g2s_thr_copyO = s2g_copyO.get_slice(threadIdx.x);
@@ -286,14 +293,18 @@ __global__ void flash_attention_kernel(const scalar_t* q, const scalar_t* k, con
   copy(g2s_copyQ, tQgQ, tQsQ);
   cp_async_fence();
 
-  // load gK_0 to sK 
-  auto gK = local_tile(K(batch_id, head_id, _, _),
-                       make_tile(size<0>(sKL), size<1>(sKL)),
-                       make_coord(0, 0)); // (bK, head_dim)
-  auto tKgK = g2s_thr_copyK.partition_S(gK);
-  copy(g2s_copyK, tKgK, tKsK);  
+  // load gK_0 to sK gV_0 to sV
+  // auto gK = local_tile(K(batch_id, head_id, _, _),
+  //                      make_tile(size<0>(sKL), size<1>(sKL)),
+  //                      make_coord(0, 0)); // (bK, head_dim)
+  // auto tKgK = g2s_thr_copyK.partition_S(gK);
+  int istage = 0;
+  int kstage = 0;
+  copy(g2s_copyK, tKgK(_, _, _, 0), tKsK(_, _, _, istage));  
   cp_async_fence();
-  cp_async_wait<1>();
+  copy(g2s_copyV, tVgV(_, _, _, 0), tVsV(_, _, _, istage));
+  istage++;
+  cp_async_wait<2>();
   __syncthreads();  
 
   //copy sQ to register 
@@ -310,28 +321,41 @@ __global__ void flash_attention_kernel(const scalar_t* q, const scalar_t* k, con
   for (size_t i = 0; i < size<2>(gKL) / size<0>(sKL); ++i) {
     clear(mma1rP);
 
-    auto gV = local_tile(V(batch_id, head_id, _, _),
-                       make_tile(size<0>(sVL), size<1>(sVL)),
-                       make_coord(i, 0));                    // (bK, head_dim)
-    auto tVgV = g2s_thr_copyV.partition_S(gV);
-    copy(g2s_copyV, tVgV, tVsV);
-    cp_async_fence();
-
-    cp_async_wait<1>();
-    __syncthreads();
-    // load sK to register
-    copy(s2r_tiled_copyK, tKsK_s2r, tKrK_s2r);
-    __syncthreads();//防止sK被下一轮的global to shared 覆盖
-
-    //load gV_{i+1} to sV
+    // auto gV = local_tile(V(batch_id, head_id, _, _),
+    //                    make_tile(size<0>(sVL), size<1>(sVL)),
+    //                    make_coord(i, 0));                    // (bK, head_dim)
+    // auto tVgV = g2s_thr_copyV.partition_S(gV);
+    // copy(g2s_copyV, tVgV, tVsV);
+    // cp_async_fence();
+  
+    //load gV_{i+1) to sV and load sK_{i+1} to sK
     if(i != size<2>(gKL) / size<0>(sKL) - 1) {
-      gK = local_tile(K(batch_id, head_id, _, _),
-                         make_tile(size<0>(sKL), size<1>(sKL)),
-                         make_coord(i + 1, 0));                    // (bK, head_dim)
-      tKgK = g2s_thr_copyK.partition_S(gK);
-      copy(g2s_copyK, tKgK, tKsK);
+      copy(g2s_copyK, tKgK(_, _, _, i + 1), tKsK(_, _, _, istage));
       cp_async_fence();
+      copy(g2s_copyV, tVgV(_, _, _, i + 1), tVsV(_, _, _, istage));
+      cp_async_fence();
+      istage = (istage + 1) % 2;
+      cp_async_wait<3>();
+    } else {
+      cp_async_wait<1>();
     }
+    __syncthreads();
+
+    // cp_async_wait<1>();
+    // __syncthreads();
+    // load sK to register
+    copy(s2r_tiled_copyK, tKsK_s2r(_, _, _, kstage), tKrK_s2r);
+    // __syncthreads();//防止sK被下一轮的global to shared 覆盖
+
+    // //load gV_{i+1} to sV
+    // if(i != size<2>(gKL) / size<0>(sKL) - 1) {
+    //   gK = local_tile(K(batch_id, head_id, _, _),
+    //                      make_tile(size<0>(sKL), size<1>(sKL)),
+    //                      make_coord(i + 1, 0));                    // (bK, head_dim)
+    //   tKgK = g2s_thr_copyK.partition_S(gK);
+    //   copy(g2s_copyK, tKgK, tKsK);
+    //   cp_async_fence();
+    // }
 
     gemm(mma1, mma1rQ, mma1rK, mma1rP);
 
@@ -345,19 +369,19 @@ __global__ void flash_attention_kernel(const scalar_t* q, const scalar_t* k, con
     convert_type_out(mma1rP_mma2_view, mma2rP);
     
     if(i != size<2>(gKL) / size<0>(sKL) - 1) {
-      cp_async_wait<1>();
+      cp_async_wait<2>();
     } else {
       cp_async_wait<0>();
     }
     __syncthreads();
 
     //copy sV to register 
-    copy(s2r_tiled_copyV, tVsV_s2r, tVrV_s2r);
-
+    copy(s2r_tiled_copyV, tVsV_s2r(_, _, _, kstage), tVrV_s2r);
+    kstage = (kstage + 1) % 2;
 
     gemm(mma2, mma2rP, mma2rV, mma2rO);
     //copy(mma2rO, mma2sO);
-    __syncthreads();
+    // __syncthreads();
   }
 
   float row_sum_inv[2];
@@ -414,14 +438,15 @@ void LaunchFlashAttentionForward(const CudaArray& q, const CudaArray& k, const C
 
   auto bN = Int<64>{};
   auto bK = Int<64>{};
+  auto kstage = Int<2>{};
 
   //auto sQ = make_layout(make_shape(bN,  _64{}), LayoutRight{});
   auto sQ = composition(Swizzle<3,3,3>{}, make_layout(make_shape(bN,  _64{}), LayoutRight{}));
   //auto sK = make_layout(make_shape(bK,  _64{}), LayoutRight{});
-  auto sK = composition(Swizzle<3,3,3>{}, make_layout(make_shape(bK,  _64{}), LayoutRight{}));
+  auto sK = composition(Swizzle<3,3,3>{}, make_layout(make_shape(bK,  _64{}, kstage), make_stride(_64{}, _1{}, _64{} * bK)));
   //auto sV = make_layout(make_shape(bK,  _64{}), LayoutRight{});
-  auto sV = composition(Swizzle<3,3,3>{}, make_layout(make_shape(bK, _64{}), LayoutRight{}));
-  auto sV_trans = composition(Swizzle<3,3,3>{}, make_layout(make_shape(_64{}, bK), LayoutLeft{}));
+  auto sV = composition(Swizzle<3,3,3>{}, make_layout(make_shape(bK, _64{}, kstage), make_stride(_64{}, _1{}, _64{} * bK)));
+  auto sV_trans = composition(Swizzle<3,3,3>{}, make_layout(make_shape(_64{}, bK, kstage), LayoutLeft{}));
   //auto sV_trans = make_layout(make_shape(_64{}, bK), LayoutLeft{});
   //auto sO = make_layout(make_shape(bN,  _64{}), LayoutRight{});
   auto sO = composition(Swizzle<3,3,3>{}, make_layout(make_shape(bN, _64{}), LayoutRight{}));
@@ -453,7 +478,7 @@ void LaunchFlashAttentionForward(const CudaArray& q, const CudaArray& k, const C
   auto s2g_copyO = make_tiled_copy(s2g_copyO_atom, 
                                   Layout<Shape<_16,_8>, Stride<_8, _1>>{},
                                   Layout<Shape<_1, _8>>{});
-  size_t smem_elems_half = (bN + bK + bK + bN) * head_dim;
+  size_t smem_elems_half = (bN + bK * 2 + bK * 2 + bN) * head_dim;
   size_t smem_half_bytes = smem_elems_half * sizeof(scalar_t);
   size_t smem_bytes = smem_half_bytes;
 
