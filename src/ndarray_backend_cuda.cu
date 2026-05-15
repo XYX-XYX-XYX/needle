@@ -272,10 +272,10 @@ __global__ void flash_attention_kernel(const scalar_t* q, const scalar_t* k, con
   auto tOgO = g2s_thr_copyO.partition_D(gO);
 
   if(thread0()) {
-    print(tKgK); print("\n");
-    print(tKsK); print("\n");
-    print(tKsK_s2r); print("\n");
-    print(tKrK_s2r); print("\n");
+    // print(tKgK); print("\n");
+    // print(tKsK); print("\n");
+    // print(tKsK_s2r); print("\n");
+    // print(tKrK_s2r); print("\n");
     // print(mma1sP); print("\n");
     // print(mma1rP); print("\n");
     // print(mma2sP); print("\n");
