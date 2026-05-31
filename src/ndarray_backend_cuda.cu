@@ -56,19 +56,12 @@ std::pair<int, int> GetCurrentCudaComputeCapabilityNoThrow() {
 
 FlashAttentionKernelTarget ResolveFlashAttentionKernel(const std::string& kernel) {
   FlashAttentionKernelTarget target = ParseFlashAttentionKernel(kernel);
+  if (target != FlashAttentionKernelTarget::kAuto) {
+    return target;
+  }
+
   auto capability = GetCurrentCudaComputeCapability();
-
-  if (target == FlashAttentionKernelTarget::kAuto) {
-    target = capability.first >= 9 ? FlashAttentionKernelTarget::kSm90 : FlashAttentionKernelTarget::kSm80;
-  }
-
-  if (target == FlashAttentionKernelTarget::kSm90 && capability.first < 9) {
-    throw std::runtime_error("flash attention sm90 kernel requires CUDA compute capability 9.x or newer");
-  }
-  if (target == FlashAttentionKernelTarget::kSm80 && capability.first < 8) {
-    throw std::runtime_error("flash attention sm80 kernel requires CUDA compute capability 8.x or newer");
-  }
-  return target;
+  return capability.first >= 9 ? FlashAttentionKernelTarget::kSm90 : FlashAttentionKernelTarget::kSm80;
 }
 
 const char* FlashAttentionKernelTargetName(FlashAttentionKernelTarget target) {
