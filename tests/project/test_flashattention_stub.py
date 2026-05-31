@@ -38,30 +38,12 @@ def _tensor_or_skip(array, device):
         raise
 
 
-@pytest.mark.parametrize("causal", [False, True])
-@pytest.mark.parametrize("dropout", [0.0, 0.1])
+@pytest.mark.parametrize("kernel", ["auto", "sm80", "sm90"])
 @pytest.mark.parametrize("device", [CUDA_DEVICE])
-def test_flashattention_module_hits_cuda_stub(causal, dropout, device):
-    np.random.seed(19943)
-    q = np.random.randn(2, 4, 8, 16).astype(np.float32)
+def test_flashattention_module_accepts_kernel_selector(kernel, device):
+    layer = nn.FlashMutiHeadAttention(dropout=0.0, causal=False, device=device, kernel=kernel)
 
-    layer = nn.FlashMutiHeadAttention(dropout=dropout, causal=causal, device=device)
-    q_tensor = _tensor_or_skip(q, device)
-    k_tensor = _tensor_or_skip(q, device)
-    v_tensor = _tensor_or_skip(q, device)
-
-    if dropout == 0.0:
-        dropout_pattern = r"0(?:\.0)?"
-    else:
-        dropout_pattern = re.escape(str(dropout))
-    escaped = (
-        r"flash attention kernel registered but not implemented "
-        r"\(batch_size=2, num_heads=4, q_len=8, kv_len=8, head_dim=16, "
-        rf"dropout={dropout_pattern}, causal={str(causal).lower()}\)"
-    )
-
-    with pytest.raises(RuntimeError, match=escaped):
-        layer(q_tensor, k_tensor, v_tensor)
+    assert layer.kernel == kernel
 
 
 class _FakeHandle:
@@ -96,14 +78,15 @@ class _FakeCudaDevice:
 
 @pytest.mark.parametrize("causal", [False, True])
 @pytest.mark.parametrize("dropout", [0.0, 0.1])
-def test_flashattention_stub_calls_cuda_hook(causal, dropout):
+@pytest.mark.parametrize("kernel", ["auto", "sm80", "sm90"])
+def test_flashattention_stub_calls_cuda_hook(causal, dropout, kernel):
     device = _FakeCudaDevice()
     q = _FakeArray((2, 4, 8, 16), device)
     k = _FakeArray((2, 4, 8, 16), device)
     v = _FakeArray((2, 4, 8, 16), device)
 
     with pytest.raises(RuntimeError, match="registered but not implemented"):
-        ndarray_api.flash_attention(q, k, v, dropout, causal)
+        ndarray_api.flash_attention(q, k, v, dropout, causal, kernel)
 
     assert len(device.calls) == 1
     hook_args = device.calls[0]
@@ -111,4 +94,14 @@ def test_flashattention_stub_calls_cuda_hook(causal, dropout):
     assert hook_args[1] is k._handle
     assert hook_args[2] is v._handle
     assert hook_args[3] is not None
-    assert hook_args[4:] == (2, 4, 8, 8, 16, dropout, causal)
+    assert hook_args[4:] == (2, 4, 8, 8, 16, dropout, causal, kernel)
+
+
+def test_flashattention_rejects_unknown_kernel():
+    device = _FakeCudaDevice()
+    q = _FakeArray((2, 4, 8, 16), device)
+    k = _FakeArray((2, 4, 8, 16), device)
+    v = _FakeArray((2, 4, 8, 16), device)
+
+    with pytest.raises(ValueError, match="kernel"):
+        ndarray_api.flash_attention(q, k, v, 0.0, False, "bad")

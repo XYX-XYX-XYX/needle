@@ -5,6 +5,9 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 option(NEEDLE_USE_FLASHATTN_STUB "Build FlashAttention stub hooks into the CUDA backend" ON)
 option(NEEDLE_CUDA_LINEINFO "Compile CUDA backend with source line info for profiling" ON)
+set(NEEDLE_CUDA_MAIN_ARCH "80" CACHE STRING "CUDA SM architecture for the pybind CUDA backend TU")
+set(NEEDLE_FLASHATTN_SM80_ARCH "80" CACHE STRING "CUDA SM architecture for src/flash_attention_sm80.cu")
+set(NEEDLE_FLASHATTN_SM90_ARCH "90a" CACHE STRING "CUDA SM architecture for src/flash_attention_sm90.cu")
 set(NEEDLE_CUTLASS_PATH "${CMAKE_CURRENT_SOURCE_DIR}/3rdparty/cutlass" CACHE PATH "Path to the CUTLASS checkout")
 
 # find correct version of Python
@@ -77,24 +80,52 @@ if(CUDA_FOUND)
     endif()
   endif()
 
-  # invoke nvidia smi to detect if we really have a GPU
-  execute_process(COMMAND "nvidia-smi" ERROR_QUIET  RESULT_VARIABLE NV_RET)
-  if(NV_RET EQUAL "0")
-    CUDA_SELECT_NVCC_ARCH_FLAGS(ARCH_FLAGS Auto)
-  else()
-    # set to 5.0 the flag of K80
-    CUDA_SELECT_NVCC_ARCH_FLAGS(ARCH_FLAGS 8.0)
-  endif()
+  function(needle_cuda_arch_flags out_var arch)
+    set(${out_var} "-gencode=arch=compute_${arch},code=sm_${arch}" PARENT_SCOPE)
+  endfunction()
 
-  set(NEEDLE_CUDA_OPTIONS ${ARCH_FLAGS} -O3 --use_fast_math -Xptxas -O3)
-  message(STATUS "Compiling CUDA backend with -O3 --use_fast_math -Xptxas -O3")
+  set(NEEDLE_CUDA_BASE_OPTIONS -O3 --use_fast_math -Xptxas -O3)
   if(NEEDLE_CUDA_LINEINFO)
-    list(APPEND NEEDLE_CUDA_OPTIONS -lineinfo)
+    list(APPEND NEEDLE_CUDA_BASE_OPTIONS -lineinfo)
     message(STATUS "Compiling CUDA backend with -lineinfo")
   endif()
 
+  needle_cuda_arch_flags(NEEDLE_CUDA_MAIN_ARCH_FLAGS ${NEEDLE_CUDA_MAIN_ARCH})
+  set(NEEDLE_CUDA_OPTIONS ${NEEDLE_CUDA_MAIN_ARCH_FLAGS} ${NEEDLE_CUDA_BASE_OPTIONS})
+  message(STATUS "Compiling CUDA pybind backend TU for SM ${NEEDLE_CUDA_MAIN_ARCH}")
+
+  set(NEEDLE_FLASHATTN_OBJECTS)
+  if(NEEDLE_ENABLE_FLASHATTN_STUB)
+    needle_cuda_arch_flags(NEEDLE_FLASHATTN_SM80_ARCH_FLAGS ${NEEDLE_FLASHATTN_SM80_ARCH})
+    needle_cuda_arch_flags(NEEDLE_FLASHATTN_SM90_ARCH_FLAGS ${NEEDLE_FLASHATTN_SM90_ARCH})
+    set(NEEDLE_FLASHATTN_COMMON_OPTIONS
+      ${NEEDLE_CUDA_BASE_OPTIONS}
+      -Xcompiler -fPIC
+      -DNEEDLE_ENABLE_FLASHATTN_STUB=1
+      "-I${NEEDLE_CUTLASS_PATH}/include"
+    )
+
+    message(STATUS "Compiling FlashAttention SM80 TU for SM ${NEEDLE_FLASHATTN_SM80_ARCH}")
+    CUDA_COMPILE(NEEDLE_FLASHATTN_SM80_OBJECTS
+      src/flash_attention_sm80.cu
+      OPTIONS ${NEEDLE_FLASHATTN_COMMON_OPTIONS} ${NEEDLE_FLASHATTN_SM80_ARCH_FLAGS}
+    )
+
+    message(STATUS "Compiling FlashAttention SM90 TU for SM ${NEEDLE_FLASHATTN_SM90_ARCH}")
+    CUDA_COMPILE(NEEDLE_FLASHATTN_SM90_OBJECTS
+      src/flash_attention_sm90.cu
+      OPTIONS ${NEEDLE_FLASHATTN_COMMON_OPTIONS} ${NEEDLE_FLASHATTN_SM90_ARCH_FLAGS}
+    )
+
+    list(APPEND NEEDLE_FLASHATTN_OBJECTS ${NEEDLE_FLASHATTN_SM80_OBJECTS} ${NEEDLE_FLASHATTN_SM90_OBJECTS})
+  endif()
+
   # set arch flags properly
-  CUDA_ADD_LIBRARY(ndarray_backend_cuda MODULE src/ndarray_backend_cuda.cu OPTIONS ${NEEDLE_CUDA_OPTIONS})
+  CUDA_ADD_LIBRARY(ndarray_backend_cuda MODULE
+    src/ndarray_backend_cuda.cu
+    ${NEEDLE_FLASHATTN_OBJECTS}
+    OPTIONS ${NEEDLE_CUDA_OPTIONS}
+  )
 
   if(NEEDLE_ENABLE_FLASHATTN_STUB)
     target_compile_definitions(ndarray_backend_cuda PRIVATE NEEDLE_ENABLE_FLASHATTN_STUB=1)

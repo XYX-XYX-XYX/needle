@@ -10,6 +10,7 @@ class FlashMutiHeadAttention(Module):
         causal = False,
         device = None,
         dtype = "float32",
+        kernel = "auto",
     ):
         device_name = getattr(device, "name", device)
         if device_name != "cuda":
@@ -20,6 +21,7 @@ class FlashMutiHeadAttention(Module):
         self.causal = causal
         self.device = device
         self.dtype = dtype
+        self.kernel = kernel
 
     def forward(
         self,
@@ -31,4 +33,4 @@ class FlashMutiHeadAttention(Module):
 
         assert q_dim == k_dim == v_dim
 
-        return ops.flashattention(q, k, v, dropout=self.dropout, causal=self.causal)
+        return ops.flashattention(q, k, v, dropout=self.dropout, causal=self.causal, kernel=self.kernel)

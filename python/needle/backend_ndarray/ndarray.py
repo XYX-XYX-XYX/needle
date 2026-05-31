@@ -761,7 +761,11 @@ def flip(a: NDArray, axes: tuple[int, ...]) -> NDArray:
     return a.flip(axes)
 
 
-def flash_attention(q: NDArray, k: NDArray, v: NDArray, dropout: float, causal: bool) -> NDArray:
+def flash_attention(q: NDArray, k: NDArray, v: NDArray, dropout: float, causal: bool, kernel: str = "auto") -> NDArray:
+    valid_kernels = {"auto", "sm80", "sm90"}
+    if kernel not in valid_kernels:
+        raise ValueError(f"FlashAttention kernel must be one of {sorted(valid_kernels)}, got {kernel!r}")
+
     if q.device != k.device or q.device != v.device:
         raise ValueError("FlashAttention expects q, k, and v to live on the same device")
 
@@ -807,6 +811,7 @@ def flash_attention(q: NDArray, k: NDArray, v: NDArray, dropout: float, causal: 
         q_dim,
         dropout,
         causal,
+        kernel,
     )
     return result
 

@@ -5,14 +5,25 @@ import numpy as np
 import needle as ndl
 from needle import backend_ndarray as nd
 
-def benchmark_flash_attention(batch_size, num_heads, seq_len, head_dim, causal, dropout, warmup=10, repeats=100):
+def benchmark_flash_attention(batch_size, num_heads, seq_len, head_dim, causal, dropout, kernel="auto", warmup=10, repeats=100):
     device = ndl.cuda()
     if not device.enabled():
         print("CUDA device not available. Profiling skipped.")
         return
 
-    print(f"Benchmarking Flash Attention: B={batch_size}, H={num_heads}, L={seq_len}, D={head_dim}, "
-          f"Causal={causal}, Dropout={dropout}")
+    if hasattr(device, "flash_attention_resolve_kernel"):
+        resolved_kernel = device.flash_attention_resolve_kernel(kernel)
+    else:
+        capability = getattr(device, "__cuda_compute_capability__", (-1, -1))
+        resolved_kernel = "sm90" if kernel == "auto" and tuple(capability)[0] >= 9 else kernel
+
+    capability = getattr(device, "__cuda_compute_capability__", (-1, -1))
+    print(
+        "Benchmarking Flash Attention: "
+        f"requested_kernel={kernel}, resolved_kernel={resolved_kernel}, "
+        f"B={batch_size}, H={num_heads}, seq_len={seq_len}, head_dim={head_dim}, "
+        f"causal={causal}, dropout={dropout}, compute_capability={tuple(capability)}"
+    )
     
     # 构造数据
     shape = (batch_size, num_heads, seq_len, head_dim)
@@ -48,6 +59,7 @@ def benchmark_flash_attention(batch_size, num_heads, seq_len, head_dim, causal, 
             head_dim,
             dropout,
             causal,
+            kernel,
             num_iters,
         )
 
@@ -82,11 +94,12 @@ if __name__ == "__main__":
     parser.add_argument("--head_dim", type=int, default=64)
     parser.add_argument("--causal", action="store_true")
     parser.add_argument("--dropout", type=float, default=0.0)
+    parser.add_argument("--kernel", choices=["auto", "sm80", "sm90"], default="auto")
     parser.add_argument("--warmup", type=int, default=10)
     parser.add_argument("--repeats", type=int, default=100)
     args = parser.parse_args()
 
     benchmark_flash_attention(
         args.batch_size, args.num_heads, args.seq_len, 
-        args.head_dim, args.causal, args.dropout, args.warmup, args.repeats
+        args.head_dim, args.causal, args.dropout, args.kernel, args.warmup, args.repeats
     )
