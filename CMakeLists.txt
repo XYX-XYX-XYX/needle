@@ -101,6 +101,7 @@ if(CUDA_FOUND)
     set(NEEDLE_FLASHATTN_COMMON_OPTIONS
       ${NEEDLE_CUDA_BASE_OPTIONS}
       -Xcompiler -fPIC
+      --expt-relaxed-constexpr
       -DNEEDLE_ENABLE_FLASHATTN_STUB=1
       "-I${NEEDLE_CUTLASS_PATH}/include"
     )
