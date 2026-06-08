@@ -113,17 +113,17 @@ constexpr size_t align_up_bytes(size_t offset, size_t alignment) {
 }
 
 template <int Arch, typename GLayoutO, typename Prod_Shape,
-          typename TmaQ, typename TmaK, typename TmaV,
+          typename TmaQ, typename TmaK, typename TmaV, typename TmaO,
           typename SLayoutQ, typename SLayoutK, typename SLayoutV, typename SLayoutO,
           typename MMA1, typename MMA2,
-          typename TiledS2GO>
+          typename AtomR2SO>
 __global__ void flash_attention_kernel_arch(const scalar_t* q, const scalar_t* k, const scalar_t* v,
                                             scalar_t* o, float dropout, bool causal, Prod_Shape prod_shape,
                                             GLayoutO gOL,
-                                            CUTLASS_GRID_CONSTANT const TmaQ tmaQ, CUTLASS_GRID_CONSTANT const TmaK tmaK, CUTLASS_GRID_CONSTANT const TmaV tmaV,
+                                            CUTLASS_GRID_CONSTANT const TmaQ tmaQ, CUTLASS_GRID_CONSTANT const TmaK tmaK, CUTLASS_GRID_CONSTANT const TmaV tmaV, CUTLASS_GRID_CONSTANT const TmaO tmaO,
                                             SLayoutQ sQL, SLayoutK sKL, SLayoutV sVL, SLayoutO sOL,
                                             MMA1 mma1, MMA2 mma2,
-                                            TiledS2GO s2g_copyO)
+                                            AtomR2SO r2s_copyO_atom)
 {
 
   // 保证整个动态 shared memory 的起始地址至少 128B 对齐
@@ -156,7 +156,7 @@ __global__ void flash_attention_kernel_arch(const scalar_t* q, const scalar_t* k
   auto mQ = tmaQ.get_tma_tensor(prod_shape);
   auto mK = tmaK.get_tma_tensor(prod_shape);
   auto mV = tmaV.get_tma_tensor(prod_shape);
-  auto O = make_tensor(make_gmem_ptr<scalar_t>(o), gOL);
+  auto mO = tmaO.get_tma_tensor(prod_shape);
 
   auto gQ = local_tile(mQ(batch_id, head_id, _, _),
                        make_tile(size<0>(sQL), size<1>(sQL)),
@@ -168,7 +168,7 @@ __global__ void flash_attention_kernel_arch(const scalar_t* q, const scalar_t* k
   auto gV = local_tile(mV(batch_id, head_id, _, _),
                        make_tile(size<0>(sVL), size<1>(sVL)),
                        make_coord(_, _0{})); //(bK, head_dim, k)
-  auto gO = local_tile(O(batch_id, head_id, _, _),
+  auto gO = local_tile(mO(batch_id, head_id, _, _),
                        make_tile(size<0>(sOL), size<1>(sOL)),
                        make_coord(seq_id, _0{}));               // (bN, head_dim)
   auto sQ = make_tensor(make_smem_ptr<scalar_t>(qShmem), sQL);   // (bN, head_dim)
@@ -187,7 +187,9 @@ __global__ void flash_attention_kernel_arch(const scalar_t* q, const scalar_t* k
                                     group_modes<0, 2>(sK), group_modes<0, 2>(gK));//(TMA, kstage)
   auto [tVgV, tVsV] = tma_partition(tmaV, Int<0>{}, Layout<_1>{},
                                     group_modes<0, 2>(sV), group_modes<0, 2>(gV));//(TMA, kstage)
-
+  auto [tOgO, tOsO] = tma_partition(tmaO, int{0}, Layout<_1>{},
+                                    group_modes<0, 2>(sO), group_modes<0, 2>(gO));//(TMA)
+  
   // mma1
   auto thr_mma1 = mma1.get_slice(threadIdx.x);
   auto mma1sQ = thr_mma1.partition_A(sQ);   // (MMA, Mma_M, Mma_K)
@@ -205,14 +207,20 @@ __global__ void flash_attention_kernel_arch(const scalar_t* q, const scalar_t* k
   auto mma2rP = thr_mma2.make_fragment_A(mma2sP);   // (MMA, Mma_M, Mma_K)
   auto mma2rV = thr_mma2.make_fragment_B(mma2sV); //(MMA, Mma_N, Mma_K)
   auto mma2rO = thr_mma2.make_fragment_C(mma2sO); // (MMA, Mma_M, Mma_N)
+  auto mma2rO_half = make_fragment_like<scalar_t>(mma2rO);
   clear(mma2rO);
 
   auto mma1rP_mma2_view = make_tensor(mma1rP.data(), mma2rP.layout());
 
   //sO to gO
-  auto g2s_thr_copyO = s2g_copyO.get_slice(threadIdx.x);
-  auto tOsO = g2s_thr_copyO.partition_S(sO);
-  auto tOgO = g2s_thr_copyO.partition_D(gO);
+  // auto g2s_thr_copyO = s2g_copyO.get_slice(threadIdx.x);
+  // auto tOsO = g2s_thr_copyO.partition_S(sO);
+  // auto tOgO = g2s_thr_copyO.partition_D(gO);
+  // rO to sO
+  auto r2s_tiled_copyO = make_tiled_copy_C(r2s_copyO_atom, mma2);
+  auto r2s_thr_copyO = r2s_tiled_copyO.get_slice(threadIdx.x);
+  auto tOrO_r2s = r2s_thr_copyO.retile_S(mma2rO_half);
+  auto tOsO_r2s = r2s_thr_copyO.partition_D(sO);
 
   if(thread0()) {
     // print("mma1 accmulator thread share memory view:"); print(mma1sP); print("\n");
@@ -225,7 +233,6 @@ __global__ void flash_attention_kernel_arch(const scalar_t* q, const scalar_t* k
   constexpr int tma_transaction_q_bytes = sizeof(scalar_t) * size(sQ);
   constexpr int tma_transaction_k_bytes = sizeof(scalar_t) * size<0>(sK) * size<1>(sK);
   constexpr int tma_transaction_v_bytes = sizeof(scalar_t) * size<0>(sV) * size<1>(sV);
-  // static_assert(tma_transaction_qkv_bytes == 128, "T
   int warp_idx = cutlass::canonical_warp_idx_sync();
   int lane_predicate = cute::elect_one_sync();
   using BarType = cutlass::arch::ClusterTransactionBarrier;
@@ -324,12 +331,18 @@ __global__ void flash_attention_kernel_arch(const scalar_t* q, const scalar_t* k
     }
   }
 
+  //convert output to fp16
+  convert_type_out(mma2rO, mma2rO_half);
   //copy o from register to share memory
-  copy(mma2rO, mma2sO);
+  copy(r2s_copyO_atom, tOrO_r2s, tOsO_r2s);
   __syncthreads();
-
+  tma_store_fence();
   // copy share memory output to global memory
-  copy(s2g_copyO, tOsO, tOgO);
+  if(warp_idx == 0 && lane_predicate) {
+    copy(tmaO, tOsO, tOgO);
+    // tma_store_arrive();
+  }
+  // tma_store_wait<0>();
   return;
 }
 
@@ -379,25 +392,25 @@ void LaunchFlashAttentionForwardForArch(const CudaArray& q, const CudaArray& k, 
   auto sK = tile_to_shape(GMMA::Layout_K_SW128_Atom<scalar_t>{}, make_shape(bK, _64{}, kstage));
   auto sV = tile_to_shape(GMMA::Layout_K_SW128_Atom<scalar_t>{}, make_shape(bK, _64{}, kstage));
   auto sO = composition(Swizzle<3,3,3>{}, make_layout(make_shape(bN, _64{}), LayoutRight{}));
+  auto sO_tma = composition(Swizzle<3,4,3>{}, make_layout(make_shape(bN, _64{}), LayoutRight{}));
+  // auto sO = tile_to_shape(GMMA::Layout_K_INTER_Atom<scalar_t>{}, make_shape(bN, _64{}));
 
   auto mQ = make_tensor(reinterpret_cast<const scalar_t*>(q.ptr), gQ);
   auto mK = make_tensor(reinterpret_cast<const scalar_t*>(k.ptr), gK);
   auto mV = make_tensor(reinterpret_cast<const scalar_t*>(v.ptr), gV);
-  //auto mO = make_tensor(reinterpret_cast<scalar_t*>(out->ptr), gO);
+  auto mO = make_tensor(reinterpret_cast<scalar_t*>(out->ptr), gO);
 
   Copy_Atom tmaQ = make_tma_atom(SM90_TMA_LOAD{}, mQ, sQ, make_shape(_1{}, _1{}, bN, _64{}));
   Copy_Atom tmaK = make_tma_atom(SM90_TMA_LOAD{}, mK, sK(_, _, 0), make_shape(_1{}, _1{}, bK, _64{}));
   Copy_Atom tmaV = make_tma_atom(SM90_TMA_LOAD{}, mV, sV(_, _, 0), make_shape(_1{}, _1{}, bK, _64{}));
+  Copy_Atom tmaO = make_tma_atom(SM90_TMA_STORE{}, mO, sO_tma, make_shape(_1{}, _1{}, bN, _64{}));
 
 
   auto mma1 = make_tiled_mma(SM90_64x64x16_F32F16F16_SS<GMMA::Major::K, GMMA::Major::K>{});
   auto mma2 = make_tiled_mma(SM90_64x64x16_F32F16F16_RS<GMMA::Major::K, GMMA::Major::MN>{});
   
-  //copy share o to global using unversial copy uint128
-  auto s2g_copyO_atom = Copy_Atom<UniversalCopy<uint128_t>, scalar_t>{};
-  auto s2g_copyO = make_tiled_copy(s2g_copyO_atom, 
-                                  Layout<Shape<_16,_8>, Stride<_8, _1>>{},
-                                  Layout<Shape<_1, _8>>{});
+
+  auto r2s_copyO_atom = Copy_Atom<SM90_U32x4_STSM_N, scalar_t>{};
 
 
 constexpr size_t kGmmaSmemAlignment = 128;
@@ -413,13 +426,14 @@ smem_bytes += 3 * sizeof(uint64_t); // TMA barriers
   using TmaQ_t = std::decay_t<decltype(tmaQ)>;
   using TmaK_t = std::decay_t<decltype(tmaK)>;
   using TmaV_t = std::decay_t<decltype(tmaV)>;
+  using TmaO_t = std::decay_t<decltype(tmaO)>;
   using SLayoutQ_t  = std::decay_t<decltype(sQ)>;
   using SLayoutK_t  = std::decay_t<decltype(sK)>;
   using SLayoutV_t  = std::decay_t<decltype(sV)>;
   using SLayoutO_t  = std::decay_t<decltype(sO)>;
   using MMA1_t      = std::decay_t<decltype(mma1)>;
   using MMA2_t      = std::decay_t<decltype(mma2)>;
-  using TiledS2GO_t = std::decay_t<decltype(s2g_copyO)>;
+  using AtomR2SO_t = std::decay_t<decltype(r2s_copyO_atom)>;
 
   dim3 block(128);
   // assum q_len % 64 == 0
@@ -431,19 +445,19 @@ smem_bytes += 3 * sizeof(uint64_t); // TMA barriers
       const scalar_t*, const scalar_t*, const scalar_t*,
       scalar_t*, float, bool, Prod_Shape_t,
       GLayoutO_t,
-      TmaQ_t,  TmaK_t, TmaV_t,
+      TmaQ_t,  TmaK_t, TmaV_t, TmaO_t,
       SLayoutQ_t, SLayoutK_t, SLayoutV_t, SLayoutO_t,
       MMA1_t, MMA2_t, 
-      TiledS2GO_t
+      AtomR2SO_t
   );
 
   Kernel_t kernel_ptr =
       flash_attention_kernel_arch<
         Arch, GLayoutO_t, Prod_Shape_t,
-        TmaQ_t, TmaK_t, TmaV_t,
+        TmaQ_t, TmaK_t, TmaV_t, TmaO_t,
         SLayoutQ_t, SLayoutK_t, SLayoutV_t, SLayoutO_t,
         MMA1_t, MMA2_t,
-        TiledS2GO_t
+        AtomR2SO_t
       >;
 
   std::string attr_context = std::string("cudaFuncSetAttribute for flash attention ") + kernel_name;
@@ -458,10 +472,10 @@ smem_bytes += 3 * sizeof(uint64_t); // TMA barriers
                                                   reinterpret_cast<const scalar_t*>(v.ptr),
                                                   reinterpret_cast<scalar_t*>(out->ptr), dropout, causal, prod_shape,
                                                   gO,
-                                                  tmaQ, tmaK, tmaV,
+                                                  tmaQ, tmaK, tmaV, tmaO,
                                                   sQ, sK, sV, sO,
                                                   mma1, mma2,
-                                                  s2g_copyO);
+                                                  r2s_copyO_atom);
   std::string launch_context = std::string("launch flash attention ") + kernel_name + " kernel";
   CudaCheck(cudaGetLastError(), launch_context.c_str());
 
