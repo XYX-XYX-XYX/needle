@@ -181,7 +181,7 @@ __global__ void flash_attention_kernel_arch(const scalar_t* q, const scalar_t* k
   auto sVt_layout = composition(sVL, make_layout(make_shape(size<1>(sVL), size<0>(sVL), size<2>(sVL)), make_stride(size<0>(sVL), _1{}, size<0>(sVL) * size<1>(sVL))));
   auto sVt = make_tensor(make_smem_ptr<scalar_t>(vShmem), sVt_layout);   // (head_dim, bK, kstage)
   auto sO = make_tensor(make_smem_ptr<scalar_t>(oShmem), sOL);   // (bN, head_dim)
-  auto sP = make_coord_tensor(make_layout(make_shape(size<0>(sQL), size<0>(sKL), _2{})));  // (bN, bK, kstage)
+  auto sP = make_coord_tensor(make_layout(make_shape(size<0>(sQL), size<0>(sKL))));  // (bN, bK)
 
 
   // load global to shared
@@ -198,24 +198,26 @@ __global__ void flash_attention_kernel_arch(const scalar_t* q, const scalar_t* k
   auto thr_mma1 = mma1.get_slice(threadIdx.x);
   auto mma1sQ = thr_mma1.partition_A(sQ);   // (MMA, Mma_M, Mma_K)
   auto mma1sK = thr_mma1.partition_B(sK);    // (MMA, Mma_N, Mma_K, kstage)
-  auto mma1sP = thr_mma1.partition_C(sP);   // (MMA, Mma_M, Mma_N, kstage)
+  auto mma1sP = thr_mma1.partition_C(sP);   // (MMA, Mma_M, Mma_N)
   auto mma1rQ = thr_mma1.make_fragment_A(mma1sQ);   // (MMA, Mma_M, Mma_K)
   auto mma1rK = thr_mma1.make_fragment_B(mma1sK);   // (MMA, Mma_N, Mma_K, kstage)
-  auto mma1rP = thr_mma1.make_fragment_C(mma1sP);   // (MMA, Mma_M, Mma_N, kstage)
-  clear(mma1rP);
+  auto mma1rP_stage1 = thr_mma1.make_fragment_C(mma1sP);   // (MMA, Mma_M, Mma_N)
+  auto mma1rP_stage2 = thr_mma1.make_fragment_C(mma1sP);   // (MMA, Mma_M, Mma_N)
+  // clear(mma1rP);
 
   // mma2 
   auto thr_mma2 = mma2.get_slice(threadIdx.x);
-  auto mma2sP = thr_mma2.partition_A(sP);   // (MMA, Mma_M, Mma_K, kstage)
+  auto mma2sP = thr_mma2.partition_A(sP);   // (MMA, Mma_M, Mma_K)
   auto mma2sV = thr_mma2.partition_B(sVt); // (MMA, Mma_N, Mma_K, kstage)
   auto mma2sO = thr_mma2.partition_C(sO);   // (MMA, Mma_M, Mma_N)
-  auto mma2rP = thr_mma2.make_fragment_A(mma2sP);   // (MMA, Mma_M, Mma_K, kstage)
+  auto mma2rP = thr_mma2.make_fragment_A(mma2sP);   // (MMA, Mma_M, Mma_K)
   auto mma2rV = thr_mma2.make_fragment_B(mma2sV); //(MMA, Mma_N, Mma_K, kstage)
   auto mma2rO = thr_mma2.make_fragment_C(mma2sO); // (MMA, Mma_M, Mma_N)
   auto mma2rO_half = make_fragment_like<scalar_t>(mma2rO);
   clear(mma2rO);
 
-  auto mma1rP_mma2_view = make_tensor(mma1rP.data(), mma2rP.layout()); //(MMA, Mma_M, Mma_K, kstage)
+  auto mma1rP_stage1_mma2_view = make_tensor(mma1rP_stage1.data(), mma2rP.layout()); //(MMA, Mma_M, Mma_K)
+  auto mma1rP_stage2_mma2_view = make_tensor(mma1rP_stage2.data(), mma2rP.layout()); //(MMA, Mma_M, Mma_K)
 
   //sO to gO
   // auto g2s_thr_copyO = s2g_copyO.get_slice(threadIdx.x);
@@ -313,21 +315,19 @@ __global__ void flash_attention_kernel_arch(const scalar_t* q, const scalar_t* k
   pipeline_k.consumer_wait(tma_k_read_state);
   pipeline_p.producer_acquire(tma_p_write_state);
   //gemm 1 for q and k_0
-  auto mma1rP_write = mma1rP(_, _, _, tma_p_write_state.index());
-  warpgroup_fence_operand(mma1rP_write);
+  clear(mma1rP_stage1);
+  warpgroup_fence_operand(mma1rP_stage1);
   warpgroup_arrive();
-  gemm(mma1, mma1rQ, mma1rK(_, _, _, tma_k_read_state.index()), mma1rP_write);
+  gemm(mma1, mma1rQ, mma1rK(_, _, _, tma_k_read_state.index()), mma1rP_stage1);
   warpgroup_commit_batch();
 
   //wait for gemm1_0 to finish which consume k_0 and produce p_0
   warpgroup_wait<0>();
-  warpgroup_fence_operand(mma1rP_write);
+  warpgroup_fence_operand(mma1rP_stage1);
   pipeline_k.consumer_release(tma_k_read_state);
   ++tma_k_read_state;
   pipeline_p.producer_commit(tma_p_write_state);
   ++tma_p_write_state;
-  // pipeline_k.consumer_release(tma_k_read_state);
-
 
   float d_scale = rsqrtf(float(get<3>(prod_shape)));
   for(size_t i = 0; i < num_tiles - 2; i++) {
@@ -348,44 +348,67 @@ __global__ void flash_attention_kernel_arch(const scalar_t* q, const scalar_t* k
 
     //launch gemm1_i+1 which consume k_i+1 and produce p_i+1
     //wait for tma for k_i+1 to finsih
-    auto mma1rP_write = mma1rP(_, _, _, tma_p_write_state.index());
     pipeline_k.consumer_wait(tma_k_read_state);
     pipeline_p.producer_acquire(tma_p_write_state);
-    clear(mma1rP_write);
-    warpgroup_fence_operand(mma1rP_write);
-    warpgroup_arrive();
-    gemm(mma1, mma1rQ, mma1rK(_, _, _, tma_k_read_state.index()), mma1rP_write);
-    warpgroup_commit_batch();
-
+    if(tma_p_write_state.index() == 0) {
+      clear(mma1rP_stage1);
+      warpgroup_fence_operand(mma1rP_stage1);
+      warpgroup_arrive();
+      gemm(mma1, mma1rQ, mma1rK(_, _, _, tma_k_read_state.index()), mma1rP_stage1);
+      warpgroup_commit_batch();
+    } else {
+      clear(mma1rP_stage2);
+      warpgroup_fence_operand(mma1rP_stage2);
+      warpgroup_arrive();
+      gemm(mma1, mma1rQ, mma1rK(_, _, _, tma_k_read_state.index()), mma1rP_stage2);
+      warpgroup_commit_batch();
+    }
     //do softmax for p_i 
     pipeline_p.consumer_wait(tma_p_read_state);
-    auto mma1rP_read = mma1rP(_, _, _, tma_p_read_state.index());
-    auto mma2rP_read = mma2rP(_, _, _, tma_p_read_state.index());
-    #pragma unroll
-    for(size_t j = 0; j < size(mma1rP_read); j++) {
-      mma1rP_read(j) = mma1rP_read(j) * d_scale;
-    }
-    if(i == 0) {
-      online_softmax<true>(mma1rP_read, row_max, row_sum, mma2rO);
+    if(tma_p_read_state.index() == 0) {
+      #pragma unroll
+      for(size_t j = 0; j < size(mma1rP_stage1); j++) {
+        mma1rP_stage1(j) = mma1rP_stage1(j) * d_scale;
+      }
+      if(i == 0) {
+        online_softmax<true>(mma1rP_stage1, row_max, row_sum, mma2rO);
+      } else {
+        online_softmax<false>(mma1rP_stage1, row_max, row_sum, mma2rO);
+      }
+      convert_type_out(mma1rP_stage1_mma2_view, mma2rP);
     } else {
-      online_softmax<false>(mma1rP_read, row_max, row_sum, mma2rO);
+      #pragma unroll
+      for(size_t j = 0; j < size(mma1rP_stage2); j++) {
+        mma1rP_stage2(j) = mma1rP_stage2(j) * d_scale;
+      }
+      if(i == 0) {
+        online_softmax<true>(mma1rP_stage2, row_max, row_sum, mma2rO);
+      } else {
+        online_softmax<false>(mma1rP_stage2, row_max, row_sum, mma2rO);
+      }
+      convert_type_out(mma1rP_stage2_mma2_view, mma2rP);
     }
-    convert_type_out(mma1rP_mma2_view(_, _, _, tma_p_read_state.index()), mma2rP_read);
+
     pipeline_p.consumer_release(tma_p_read_state);
     ++tma_p_read_state;
     //launch mma2 for mma2p_i and v_i
     //wait for tma for v_i to finish
     pipeline_v.consumer_wait(tma_v_read_state);
-    warpgroup_fence_operand(mma2rP_read);
+    warpgroup_fence_operand(mma2rP);
     warpgroup_fence_operand(mma2rO);
     warpgroup_arrive();
-    gemm(mma2, mma2rP_read, mma2rV(_, _, _, tma_v_read_state.index()), mma2rO);
+    gemm(mma2, mma2rP, mma2rV(_, _, _, tma_v_read_state.index()), mma2rO);
     warpgroup_commit_batch();
 
     //wait for gemm1 and gemm2 to finish
     warpgroup_wait<0>();
-    warpgroup_fence_operand(mma1rP_write);
-    warpgroup_fence_operand(mma2rP_read);
+    if(tma_p_write_state.index() == 0) {
+      warpgroup_fence_operand(mma1rP_stage1);
+    } else {
+      warpgroup_fence_operand(mma1rP_stage2);
+    }
+    // warpgroup_fence_operand(mma1rP_write);
+    warpgroup_fence_operand(mma2rP);
     warpgroup_fence_operand(mma2rO);
 
     pipeline_k.consumer_release(tma_k_read_state);
@@ -398,18 +421,14 @@ __global__ void flash_attention_kernel_arch(const scalar_t* q, const scalar_t* k
     __syncthreads();
   }
 
-  // tile_idx = num_tiles - 2
   {
     size_t tile_idx = num_tiles - 2;
     if(lane_predicate && warp_idx == 0) {
       //wait for consumer to release 
-      // pipeline_k.producer_acquire(tma_k_write_state);
       pipeline_v.producer_acquire(tma_v_write_state);
       //global to share for k_i+2 and v_i+1
-      // auto tma_barrier_k = pipeline_k.producer_get_barrier(tma_k_write_state);
       auto tma_barrier_v = pipeline_v.producer_get_barrier(tma_v_write_state);
       //copy global to share for k_i+2 and v_i+1
-      // copy(tmaK.with(*tma_barrier_k), tKgK(_, i + 2), tKsK(_, tma_k_write_state.index()));
       copy(tmaV.with(*tma_barrier_v), tVgV(_, tile_idx + 1), tVsV(_, tma_v_write_state.index()));
       // ++tma_k_write_state;
       ++tma_v_write_state;
@@ -417,41 +436,58 @@ __global__ void flash_attention_kernel_arch(const scalar_t* q, const scalar_t* k
 
     //launch gemm1_i+1 which consume k_i+1 and produce p_i+1
     //wait for tma for k_i+1 to finsih
-    auto mma1rP_write = mma1rP(_, _, _, tma_p_write_state.index());
     pipeline_k.consumer_wait(tma_k_read_state);
     pipeline_p.producer_acquire(tma_p_write_state);
-    clear(mma1rP_write);
-    warpgroup_fence_operand(mma1rP_write);
-    warpgroup_arrive();
-    gemm(mma1, mma1rQ, mma1rK(_, _, _, tma_k_read_state.index()), mma1rP_write);
-    warpgroup_commit_batch();
-
+    if(tma_p_write_state.index() == 0) {
+      clear(mma1rP_stage1);
+      warpgroup_fence_operand(mma1rP_stage1);
+      warpgroup_arrive();
+      gemm(mma1, mma1rQ, mma1rK(_, _, _, tma_k_read_state.index()), mma1rP_stage1);
+      warpgroup_commit_batch();
+    } else {
+      clear(mma1rP_stage2);
+      warpgroup_fence_operand(mma1rP_stage2);
+      warpgroup_arrive();
+      gemm(mma1, mma1rQ, mma1rK(_, _, _, tma_k_read_state.index()), mma1rP_stage2);
+      warpgroup_commit_batch();
+    }
     //do softmax for p_i 
     pipeline_p.consumer_wait(tma_p_read_state);
-    auto mma1rP_read = mma1rP(_, _, _, tma_p_read_state.index());
-    auto mma2rP_read = mma2rP(_, _, _, tma_p_read_state.index());
-    #pragma unroll
-    for(size_t j = 0; j < size(mma1rP_read); j++) {
-      mma1rP_read(j) = mma1rP_read(j) * d_scale;
+    if(tma_p_read_state.index() == 0) {
+      #pragma unroll
+      for(size_t j = 0; j < size(mma1rP_stage1); j++) {
+        mma1rP_stage1(j) = mma1rP_stage1(j) * d_scale;
+      }
+      online_softmax<false>(mma1rP_stage1, row_max, row_sum, mma2rO);
+      convert_type_out(mma1rP_stage1_mma2_view, mma2rP);
+    } else {
+      #pragma unroll
+      for(size_t j = 0; j < size(mma1rP_stage2); j++) {
+        mma1rP_stage2(j) = mma1rP_stage2(j) * d_scale;
+      }
+      online_softmax<false>(mma1rP_stage2, row_max, row_sum, mma2rO);
+      convert_type_out(mma1rP_stage2_mma2_view, mma2rP);
     }
-    online_softmax<false>(mma1rP_read, row_max, row_sum, mma2rO);
-  
-    convert_type_out(mma1rP_mma2_view(_, _, _, tma_p_read_state.index()), mma2rP_read);
+
     pipeline_p.consumer_release(tma_p_read_state);
     ++tma_p_read_state;
     //launch mma2 for mma2p_i and v_i
     //wait for tma for v_i to finish
     pipeline_v.consumer_wait(tma_v_read_state);
-    warpgroup_fence_operand(mma2rP_read);
+    warpgroup_fence_operand(mma2rP);
     warpgroup_fence_operand(mma2rO);
     warpgroup_arrive();
-    gemm(mma2, mma2rP_read, mma2rV(_, _, _, tma_v_read_state.index()), mma2rO);
+    gemm(mma2, mma2rP, mma2rV(_, _, _, tma_v_read_state.index()), mma2rO);
     warpgroup_commit_batch();
 
     //wait for gemm1 and gemm2 to finish
     warpgroup_wait<0>();
-    warpgroup_fence_operand(mma1rP_write);
-    warpgroup_fence_operand(mma2rP_read);
+    if(tma_p_write_state.index() == 0) {
+      warpgroup_fence_operand(mma1rP_stage1);
+    } else {
+      warpgroup_fence_operand(mma1rP_stage2);
+    }
+    warpgroup_fence_operand(mma2rP);
     warpgroup_fence_operand(mma2rO);
 
     pipeline_k.consumer_release(tma_k_read_state);
@@ -463,37 +499,49 @@ __global__ void flash_attention_kernel_arch(const scalar_t* q, const scalar_t* k
     
     __syncthreads();
   }
-   {
+
+  {
     size_t tile_idx = num_tiles - 1;
     //do softmax for p_i 
     pipeline_p.consumer_wait(tma_p_read_state);
-    auto mma1rP_read = mma1rP(_, _, _, tma_p_read_state.index());
-    auto mma2rP_read = mma2rP(_, _, _, tma_p_read_state.index());
-    #pragma unroll
-    for(size_t j = 0; j < size(mma1rP_read); j++) {
-      mma1rP_read(j) = mma1rP_read(j) * d_scale;
+    if(tma_p_read_state.index() == 0) {
+      #pragma unroll
+      for(size_t j = 0; j < size(mma1rP_stage1); j++) {
+        mma1rP_stage1(j) = mma1rP_stage1(j) * d_scale;
+      }
+      online_softmax<false>(mma1rP_stage1, row_max, row_sum, mma2rO);
+      convert_type_out(mma1rP_stage1_mma2_view, mma2rP);
+    } else {
+      #pragma unroll
+      for(size_t j = 0; j < size(mma1rP_stage2); j++) {
+        mma1rP_stage2(j) = mma1rP_stage2(j) * d_scale;
+      }
+      online_softmax<false>(mma1rP_stage2, row_max, row_sum, mma2rO);
+      convert_type_out(mma1rP_stage2_mma2_view, mma2rP);
     }
 
-    online_softmax<false>(mma1rP_read, row_max, row_sum, mma2rO);
-  
-    convert_type_out(mma1rP_mma2_view(_, _, _, tma_p_read_state.index()), mma2rP_read);
     pipeline_p.consumer_release(tma_p_read_state);
     ++tma_p_read_state;
     //launch mma2 for mma2p_i and v_i
     //wait for tma for v_i to finish
     pipeline_v.consumer_wait(tma_v_read_state);
-    warpgroup_fence_operand(mma2rP_read);
+    warpgroup_fence_operand(mma2rP);
     warpgroup_fence_operand(mma2rO);
     warpgroup_arrive();
-    gemm(mma2, mma2rP_read, mma2rV(_, _, _, tma_v_read_state.index()), mma2rO);
+    gemm(mma2, mma2rP, mma2rV(_, _, _, tma_v_read_state.index()), mma2rO);
     warpgroup_commit_batch();
 
-    //wait for  gemm2 to finish
+    //wait for gemm1 and gemm2 to finish
     warpgroup_wait<0>();
-    warpgroup_fence_operand(mma2rP_read);
+    if(tma_p_write_state.index() == 0) {
+      warpgroup_fence_operand(mma1rP_stage1);
+    } else {
+      warpgroup_fence_operand(mma1rP_stage2);
+    }
+    // warpgroup_fence_operand(mma1rP_write);
+    warpgroup_fence_operand(mma2rP);
     warpgroup_fence_operand(mma2rO);
 
-    
     __syncthreads();
   }
 

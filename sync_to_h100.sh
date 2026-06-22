@@ -8,7 +8,7 @@ paths=(
   "src"
   # "tests"
   # "python"
-  # "CMakeLists.txt"
+  "CMakeLists.txt"
   "project.ipynb"
 )
 
