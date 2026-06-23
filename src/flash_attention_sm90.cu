@@ -363,28 +363,19 @@ __global__ void flash_attention_kernel_arch(const scalar_t* q, const scalar_t* k
     gemm(mma1, mma1rQ, mma1rK(_, _, _, tma_k_read_state.index()), mma1rP);
     warpgroup_commit_batch();
 
-    //scale rQ
-    if(i != 0) {
-      #pragma unroll
-      for(size_t j = 0; j < size<0, 2>(mma2rO); j++) {
-        for(size_t k = 0; k < size<0, 0>(mma2rO); k++) {
-          mma2rO(make_coord(k, 0, j), 0, 0) = mma2rO(make_coord(k, 0, j), 0, 0) * scale[0];
-          mma2rO(make_coord(k, 1, j), 0, 0) = mma2rO(make_coord(k, 1, j), 0, 0) * scale[1];
-        }
-      }
-    }
-
-    warpgroup_wait<0>();
-    warpgroup_fence_operand(mma1rP);
-    pipeline_k.consumer_release(tma_k_read_state);
-    ++tma_k_read_state;
-
     pipeline_v.consumer_wait(tma_v_read_state);
     warpgroup_fence_operand(mma2rO);
     warpgroup_fence_operand(mma2rP);
     warpgroup_arrive();
     gemm(mma2, mma2rP, mma2rV(_, _, _, tma_v_read_state.index()), mma2rO);
     warpgroup_commit_batch();
+
+    warpgroup_wait<1>();
+    warpgroup_fence_operand(mma1rP);
+    pipeline_k.consumer_release(tma_k_read_state);
+    ++tma_k_read_state;
+
+
 
     #pragma unroll
     for(size_t j = 0; j < size(mma1rP); j++) {
@@ -397,6 +388,14 @@ __global__ void flash_attention_kernel_arch(const scalar_t* q, const scalar_t* k
     warpgroup_fence_operand(mma2rP);
     pipeline_v.consumer_release(tma_v_read_state);
     ++tma_v_read_state;
+    //scale rO
+    #pragma unroll
+    for(size_t j = 0; j < size<0, 2>(mma2rO); j++) {
+      for(size_t k = 0; k < size<0, 0>(mma2rO); k++) {
+        mma2rO(make_coord(k, 0, j), 0, 0) = mma2rO(make_coord(k, 0, j), 0, 0) * scale[0];
+        mma2rO(make_coord(k, 1, j), 0, 0) = mma2rO(make_coord(k, 1, j), 0, 0) * scale[1];
+      }
+    }
     convert_type_out(mma1rP_mma2_view, mma2rP);
     
     __syncthreads();
@@ -422,26 +421,18 @@ __global__ void flash_attention_kernel_arch(const scalar_t* q, const scalar_t* k
     gemm(mma1, mma1rQ, mma1rK(_, _, _, tma_k_read_state.index()), mma1rP);
     warpgroup_commit_batch();
 
-    //scale rQ
-    #pragma unroll
-    for(size_t j = 0; j < size<0, 2>(mma2rO); j++) {
-      for(size_t k = 0; k < size<0, 0>(mma2rO); k++) {
-        mma2rO(make_coord(k, 0, j), 0, 0) = mma2rO(make_coord(k, 0, j), 0, 0) * scale[0];
-        mma2rO(make_coord(k, 1, j), 0, 0) = mma2rO(make_coord(k, 1, j), 0, 0) * scale[1];
-      }
-    }
-
-    warpgroup_wait<0>();
-    warpgroup_fence_operand(mma1rP);
-    pipeline_k.consumer_release(tma_k_read_state);
-    ++tma_k_read_state;
-
     pipeline_v.consumer_wait(tma_v_read_state);
     warpgroup_fence_operand(mma2rO);
     warpgroup_fence_operand(mma2rP);
     warpgroup_arrive();
     gemm(mma2, mma2rP, mma2rV(_, _, _, tma_v_read_state.index()), mma2rO);
     warpgroup_commit_batch();
+
+    warpgroup_wait<1>();
+    warpgroup_fence_operand(mma1rP);
+    pipeline_k.consumer_release(tma_k_read_state);
+    ++tma_k_read_state;
+
 
     #pragma unroll
     for(size_t j = 0; j < size(mma1rP); j++) {
@@ -454,13 +445,7 @@ __global__ void flash_attention_kernel_arch(const scalar_t* q, const scalar_t* k
     warpgroup_fence_operand(mma2rP);
     pipeline_v.consumer_release(tma_v_read_state);
     ++tma_v_read_state;
-    convert_type_out(mma1rP_mma2_view, mma2rP);
-    
-    __syncthreads();
-  }
-
-  {
-    //scale rQ
+    //scale rO
     #pragma unroll
     for(size_t j = 0; j < size<0, 2>(mma2rO); j++) {
       for(size_t k = 0; k < size<0, 0>(mma2rO); k++) {
@@ -468,13 +453,19 @@ __global__ void flash_attention_kernel_arch(const scalar_t* q, const scalar_t* k
         mma2rO(make_coord(k, 1, j), 0, 0) = mma2rO(make_coord(k, 1, j), 0, 0) * scale[1];
       }
     }
+    convert_type_out(mma1rP_mma2_view, mma2rP);
+    
+    __syncthreads();
+  }
+
+  {
 
     pipeline_v.consumer_wait(tma_v_read_state);
     warpgroup_fence_operand(mma2rO);
     warpgroup_fence_operand(mma2rP);
     warpgroup_arrive();
     gemm(mma2, mma2rP, mma2rV(_, _, _, tma_v_read_state.index()), mma2rO);
-    warpgroup_commit_batch();    
+    warpgroup_commit_batch();       
     warpgroup_wait<0>();
     warpgroup_fence_operand(mma2rO);
     warpgroup_fence_operand(mma2rP);
