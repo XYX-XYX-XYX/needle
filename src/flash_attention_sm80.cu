@@ -412,16 +412,22 @@ void LaunchFlashAttentionForwardForArch(const CudaArray& q, const CudaArray& k, 
   auto bK = Int<64>{};
   auto kstage = Int<2>{};
 
+  auto swizzle_atom = composition(Swizzle<3, 3, 3>{}, Layout<Shape<_8, _64>, Stride<_64, _1>>{});
+  auto sQ = tile_to_shape(swizzle_atom, make_shape(bN, _64{}));
+  auto sK = tile_to_shape(swizzle_atom, make_shape(bK, _64{}, kstage));
+  auto sV = tile_to_shape(swizzle_atom, make_shape(bK, _64{}, kstage));
+  auto sV_trans = composition(sV, make_layout(make_shape(_64{}, bK, kstage), make_stride(bK, _1{}, _64{} * bK)));
+  auto sO = tile_to_shape(swizzle_atom, make_shape(bN, _64{}));
   //auto sQ = make_layout(make_shape(bN,  _64{}), LayoutRight{});
-  auto sQ = composition(Swizzle<3,3,3>{}, make_layout(make_shape(bN,  _64{}), LayoutRight{}));
+  // auto sQ = composition(Swizzle<3,3,3>{}, make_layout(make_shape(bN,  _64{}), LayoutRight{}));
   //auto sK = make_layout(make_shape(bK,  _64{}), LayoutRight{});
-  auto sK = composition(Swizzle<3,3,3>{}, make_layout(make_shape(bK,  _64{}, kstage), make_stride(_64{}, _1{}, _64{} * bK)));
+  // auto sK = composition(Swizzle<3,3,3>{}, make_layout(make_shape(bK,  _64{}, kstage), make_stride(_64{}, _1{}, _64{} * bK)));
   //auto sV = make_layout(make_shape(bK,  _64{}), LayoutRight{});
-  auto sV = composition(Swizzle<3,3,3>{}, make_layout(make_shape(bK, _64{}, kstage), make_stride(_64{}, _1{}, _64{} * bK)));
-  auto sV_trans = composition(Swizzle<3,3,3>{}, make_layout(make_shape(_64{}, bK, kstage), LayoutLeft{}));
+  // auto sV = composition(Swizzle<3,3,3>{}, make_layout(make_shape(bK, _64{}, kstage), make_stride(_64{}, _1{}, _64{} * bK)));
+  // auto sV_trans = composition(Swizzle<3,3,3>{}, make_layout(make_shape(_64{}, bK, kstage), LayoutLeft{}));
   //auto sV_trans = make_layout(make_shape(_64{}, bK), LayoutLeft{});
   //auto sO = make_layout(make_shape(bN,  _64{}), LayoutRight{});
-  auto sO = composition(Swizzle<3,3,3>{}, make_layout(make_shape(bN, _64{}), LayoutRight{}));
+  // auto sO = composition(Swizzle<3,3,3>{}, make_layout(make_shape(bN, _64{}), LayoutRight{}));
 
   //copy gobal to share memory
   auto g2s_copyQ = make_tiled_copy(Copy_Atom<SM80_CP_ASYNC_CACHEGLOBAL<uint128_t>, scalar_t>{}, 
