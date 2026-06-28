@@ -184,7 +184,7 @@ __global__ void flash_attention_kernel_arch(const scalar_t* q, const scalar_t* k
   auto [tVgV, tVsV] = tma_partition(tmaV, Int<0>{}, Layout<_1>{},
                                     group_modes<0, 2>(sV), group_modes<0, 2>(gV));//(TMA, kstage)
   auto [tOgO, tOsO] = tma_partition(tmaO, int{0}, Layout<_1>{},
-                                    group_modes<0, 2>(sK), group_modes<0, 2>(gO));//(TMA)
+                                    group_modes<0, 2>(sO), group_modes<0, 2>(gO));//(TMA)
   
   // mma1
   auto thr_mma1 = mma1.get_slice(threadIdx.x);
