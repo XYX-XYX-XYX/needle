@@ -118,7 +118,7 @@ template <int Arch, typename GLayoutO, typename Prod_Shape,
           typename SLayoutQ, typename SLayoutK, typename SLayoutV, typename SLayoutO,
           typename MMA1, typename MMA2,
           typename AtomR2SO>
-__global__ __launch_bounds__(256, 3) 
+__global__ __launch_bounds__(256, 2) 
 void flash_attention_kernel_arch(const scalar_t* q, const scalar_t* k, const scalar_t* v,
                                             scalar_t* o, float dropout, bool causal, Prod_Shape prod_shape,
                                             GLayoutO gOL,
@@ -230,8 +230,9 @@ void flash_attention_kernel_arch(const scalar_t* q, const scalar_t* k, const sca
       BarType::arrive_and_expect_tx(tma_barrier_q, tma_transaction_q_bytes);
       copy(tmaQ.with(*tma_barrier_q), tQgQ, tQsQ);
     }
-
-    for(size_t i = 0; i < num_tiles; i++) {
+    
+    int num_kv_tiles = get<2>(prod_shape) / size<0>(sKL);
+    for(size_t i = 0; i < num_kv_tiles; i++) {
       if(lane_predicate && warp_idx == 0) {
         pipeline_k.producer_acquire(tma_k_write_state);
         auto tma_barrier_k = pipeline_k.producer_get_barrier(tma_k_write_state);
@@ -247,7 +248,7 @@ void flash_attention_kernel_arch(const scalar_t* q, const scalar_t* k, const sca
 
   } else {
     //consumer
-    cutlass::arch::warpgroup_reg_alloc<112>();
+    cutlass::arch::warpgroup_reg_alloc<160>();
     float row_max[2] = {-FLT_MAX, -FLT_MAX};
     float row_sum[2] = {0.0f, 0.0f};
     float scale[2];
@@ -309,8 +310,8 @@ void flash_attention_kernel_arch(const scalar_t* q, const scalar_t* k, const sca
     convert_type_out(mma1rP_mma2_view, mma2rP);
 
 
-    int num_tiles = get<2>(prod_shape) / size<0>(sQL);
-    for(size_t i = 0; i < num_tiles - 1; i++) {
+    int num_kv_tiles = get<2>(prod_shape) / size<0>(sKL);
+    for(size_t i = 0; i < num_kv_tiles - 1; i++) {
       //wait tma k_i+1 to finish and launch gemm1_i+1
       pipeline_k.consumer_wait(tma_k_read_state);
       clear(mma1rP);
@@ -391,6 +392,7 @@ void flash_attention_kernel_arch(const scalar_t* q, const scalar_t* k, const sca
                                             cutlass::arch::ReservedNamedBarriers::EpilogueBarrier);
     //prepare tma load
     int bid = blockIdx.x;
+    int num_tiles = get<2>(prod_shape) / size<0>(sOL);
     int seq_id = bid % num_tiles;
     int head_id = (bid / num_tiles) % get<1>(prod_shape);
     int batch_id = bid / (num_tiles * get<1>(prod_shape));
@@ -449,7 +451,7 @@ void LaunchFlashAttentionForwardForArch(const CudaArray& q, const CudaArray& k, 
   auto prod_shape = make_shape(batch_size, num_heads, q_len, head_dim);
 
   auto bN = Int<64>{};
-  auto bK = Int<64>{};
+  auto bK = Int<128>{};
   auto kstage = Int<2>{};
 
 
@@ -471,7 +473,7 @@ void LaunchFlashAttentionForwardForArch(const CudaArray& q, const CudaArray& k, 
   Copy_Atom tmaO = make_tma_atom(SM90_TMA_STORE{}, mO, sO, make_shape(_1{}, _1{}, bN, _64{}));
 
 
-  auto mma1 = make_tiled_mma(SM90_64x64x16_F32F16F16_SS<GMMA::Major::K, GMMA::Major::K>{});
+  auto mma1 = make_tiled_mma(SM90_64x128x16_F32F16F16_SS<GMMA::Major::K, GMMA::Major::K>{});
   auto mma2 = make_tiled_mma(SM90_64x64x16_F32F16F16_RS<GMMA::Major::K, GMMA::Major::MN>{});
   
 
@@ -482,7 +484,7 @@ constexpr size_t kGmmaSmemAlignment = 128;
 
 size_t smem_bytes = 0;
 smem_bytes = align_up_bytes(smem_bytes, kGmmaSmemAlignment);
-smem_bytes += (bN + bK * 2 + bK * 2 + bN) * head_dim * sizeof(scalar_t); // sQ, sK, sV, sO
+smem_bytes += (bN + bK * kstage + bK * kstage + bN) * head_dim * sizeof(scalar_t); // sQ, sK, sV, sO
 smem_bytes += 2 * sizeof(typename cutlass::PipelineTmaAsync<_2{}>::SharedStorage) + 
                 sizeof(typename cutlass::PipelineAsync<_2{}>::SharedStorage) +
                 sizeof(uint64_t); // TMA barriers
