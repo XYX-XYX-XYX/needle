@@ -84,7 +84,13 @@ if(CUDA_FOUND)
     set(${out_var} "-gencode=arch=compute_${arch},code=sm_${arch}" PARENT_SCOPE)
   endfunction()
 
-  set(NEEDLE_CUDA_BASE_OPTIONS -O3 --use_fast_math -Xptxas -O3)
+  set(NEEDLE_CUDA_BASE_OPTIONS
+    -O3
+    --use_fast_math
+    -Xptxas -O3
+    -Xptxas -v
+    -Xptxas --warn-on-spills
+  )
   if(NEEDLE_CUDA_LINEINFO)
     list(APPEND NEEDLE_CUDA_BASE_OPTIONS -lineinfo)
     message(STATUS "Compiling CUDA backend with -lineinfo")

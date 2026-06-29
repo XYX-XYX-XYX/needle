@@ -9,7 +9,7 @@ CompileFlags:
     - -std=c++14
     - -nocudainc
     - --cuda-path=/usr/local/cuda
-    - --cuda-gpu-arch=sm_80
+    - --cuda-gpu-arch=sm_90
     - --cuda-host-only
     - --no-cuda-version-check
     - -ferror-limit=0

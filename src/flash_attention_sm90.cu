@@ -17,6 +17,7 @@
 #include "cutlass/arch/barrier.h"
 #include "cutlass/pipeline/pipeline.hpp"
 #include <cutlass/arch/reg_reconfig.h>
+#include <cutlass/arch/barrier.h>
 
 
 
@@ -117,7 +118,8 @@ template <int Arch, typename GLayoutO, typename Prod_Shape,
           typename SLayoutQ, typename SLayoutK, typename SLayoutV, typename SLayoutO,
           typename MMA1, typename MMA2,
           typename AtomR2SO>
-__global__ void flash_attention_kernel_arch(const scalar_t* q, const scalar_t* k, const scalar_t* v,
+__global__ __launch_bounds__(256, 3) 
+void flash_attention_kernel_arch(const scalar_t* q, const scalar_t* k, const scalar_t* v,
                                             scalar_t* o, float dropout, bool causal, Prod_Shape prod_shape,
                                             GLayoutO gOL,
                                             CUTLASS_GRID_CONSTANT const TmaQ tmaQ, CUTLASS_GRID_CONSTANT const TmaK tmaK, CUTLASS_GRID_CONSTANT const TmaV tmaV, CUTLASS_GRID_CONSTANT const TmaO tmaO,
@@ -189,6 +191,7 @@ __global__ void flash_attention_kernel_arch(const scalar_t* q, const scalar_t* k
 
   if(warp_group_idx == 0) {
     //producer 
+    cutlass::arch::warpgroup_reg_dealloc<24>();
     int bid = blockIdx.x;
     int num_tiles = get<2>(prod_shape) / size<0>(sQL);
     int seq_id = bid % num_tiles;
@@ -226,52 +229,25 @@ __global__ void flash_attention_kernel_arch(const scalar_t* q, const scalar_t* k
       // global q to share q
       BarType::arrive_and_expect_tx(tma_barrier_q, tma_transaction_q_bytes);
       copy(tmaQ.with(*tma_barrier_q), tQgQ, tQsQ);
-      // global k_0 to share k_0
-      pipeline_k.producer_acquire(tma_k_write_state);
-      auto tma_barrier_k = pipeline_k.producer_get_barrier(tma_k_write_state);
-      copy(tmaK.with(*tma_barrier_k), tKgK(_, 0), tKsK(_, tma_k_write_state.index()));
-      // pipeline_k.producer_commit(tma_k_write_state);
-      ++tma_k_write_state;
-      //global k_1 to share k_1
-      pipeline_k.producer_acquire(tma_k_write_state);
-      auto tma_barrier_k_1 = pipeline_k.producer_get_barrier(tma_k_write_state);
-      copy(tmaK.with(*tma_barrier_k_1), tKgK(_, 1), tKsK(_, tma_k_write_state.index()));
-      ++tma_k_write_state;
-      //global v_0 to share v_0
-      pipeline_v.producer_acquire(tma_v_write_state);
-      auto tma_barrier_v = pipeline_v.producer_get_barrier(tma_v_write_state);
-      copy(tmaV.with(*tma_barrier_v), tVgV(_, 0), tVsV(_, tma_v_write_state.index()));
-      ++tma_v_write_state;
     }
 
-    for(size_t i = 0; i < num_tiles - 2; i++) {
+    for(size_t i = 0; i < num_tiles; i++) {
       if(lane_predicate && warp_idx == 0) {
-        //wait for consumer to release 
         pipeline_k.producer_acquire(tma_k_write_state);
-        pipeline_v.producer_acquire(tma_v_write_state);
-        //global to share for k_i+2 and v_i+1
         auto tma_barrier_k = pipeline_k.producer_get_barrier(tma_k_write_state);
-        auto tma_barrier_v = pipeline_v.producer_get_barrier(tma_v_write_state);
-        //copy global to share for k_i+2 and v_i+1
-        copy(tmaK.with(*tma_barrier_k), tKgK(_, i + 2), tKsK(_, tma_k_write_state.index()));
-        copy(tmaV.with(*tma_barrier_v), tVgV(_, i + 1), tVsV(_, tma_v_write_state.index()));
+        copy(tmaK.with(*tma_barrier_k), tKgK(_, i), tKsK(_, tma_k_write_state.index()));
         ++tma_k_write_state;
+
+        pipeline_v.producer_acquire(tma_v_write_state);
+        auto tma_barrier_v = pipeline_v.producer_get_barrier(tma_v_write_state);
+        copy(tmaV.with(*tma_barrier_v), tVgV(_, i), tVsV(_, tma_v_write_state.index()));
         ++tma_v_write_state;
       }
     }
 
-    size_t tile_idx = num_tiles - 2;
-    if(lane_predicate && warp_idx == 0) {
-      //wait for consumer to release 
-      pipeline_v.producer_acquire(tma_v_write_state);
-      //global to share for k_i+2 and v_i+1
-      auto tma_barrier_v = pipeline_v.producer_get_barrier(tma_v_write_state);
-      //copy global to share for k_i+2 and v_i+1
-      copy(tmaV.with(*tma_barrier_v), tVgV(_, tile_idx + 1), tVsV(_, tma_v_write_state.index()));
-      ++tma_v_write_state;
-    }
   } else {
     //consumer
+    cutlass::arch::warpgroup_reg_alloc<112>();
     float row_max[2] = {-FLT_MAX, -FLT_MAX};
     float row_sum[2] = {0.0f, 0.0f};
     float scale[2];
@@ -332,8 +308,9 @@ __global__ void flash_attention_kernel_arch(const scalar_t* q, const scalar_t* k
     //mma1rP to mma2rP
     convert_type_out(mma1rP_mma2_view, mma2rP);
 
+
     int num_tiles = get<2>(prod_shape) / size<0>(sQL);
-    for(size_t i = 0; i < num_tiles - 2; i++) {
+    for(size_t i = 0; i < num_tiles - 1; i++) {
       //wait tma k_i+1 to finish and launch gemm1_i+1
       pipeline_k.consumer_wait(tma_k_read_state);
       clear(mma1rP);
@@ -379,44 +356,7 @@ __global__ void flash_attention_kernel_arch(const scalar_t* q, const scalar_t* k
       convert_type_out(mma1rP_mma2_view, mma2rP);
     }
 
-    {
-      pipeline_k.consumer_wait(tma_k_read_state);
-      clear(mma1rP);
-      warpgroup_fence_operand(mma1rP);
-      warpgroup_arrive();
-      gemm(mma1, mma1rQ, mma1rK(_, _, _, tma_k_read_state.index()), mma1rP);
-      warpgroup_commit_batch();
-
-      pipeline_v.consumer_wait(tma_v_read_state);
-      warpgroup_fence_operand(mma2rO);
-      warpgroup_fence_operand(mma2rP);
-      warpgroup_arrive();
-      gemm(mma2, mma2rP, mma2rV(_, _, _, tma_v_read_state.index()), mma2rO);
-      warpgroup_commit_batch();
-
-      warpgroup_wait<1>();
-      warpgroup_fence_operand(mma1rP);
-      pipeline_k.consumer_release(tma_k_read_state);
-      ++tma_k_read_state;
-
-      online_softmax<false>(mma1rP, d_scale, row_max, row_sum, scale);
-      
-      warpgroup_wait<0>();
-      warpgroup_fence_operand(mma2rO);
-      warpgroup_fence_operand(mma2rP);
-      pipeline_v.consumer_release(tma_v_read_state);
-      ++tma_v_read_state;
-      //scale rO
-      #pragma unroll
-      for(size_t j = 0; j < size<0, 2>(mma2rO); j++) {
-        for(size_t k = 0; k < size<0, 0>(mma2rO); k++) {
-          mma2rO(make_coord(k, 0, j), 0, 0) = mma2rO(make_coord(k, 0, j), 0, 0) * scale[0];
-          mma2rO(make_coord(k, 1, j), 0, 0) = mma2rO(make_coord(k, 1, j), 0, 0) * scale[1];
-        }
-      }
-      convert_type_out(mma1rP_mma2_view, mma2rP);
-    }
-
+    //num_tiles - 1, only do gemm2
     {
       pipeline_v.consumer_wait(tma_v_read_state);
       warpgroup_fence_operand(mma2rO);
@@ -427,10 +367,9 @@ __global__ void flash_attention_kernel_arch(const scalar_t* q, const scalar_t* k
       warpgroup_wait<0>();
       warpgroup_fence_operand(mma2rO);
       warpgroup_fence_operand(mma2rP);
-      
-      // __syncthreads();
     }
 
+    //epilogue
     //finalize scaling output by row_sum
     float row_sum_inv[2];
     row_sum_inv[0] = 1.0f / row_sum[0];
@@ -441,20 +380,17 @@ __global__ void flash_attention_kernel_arch(const scalar_t* q, const scalar_t* k
         mma2rO(make_coord(j, 1, i), 0, 0) = mma2rO(make_coord(j, 1, i), 0, 0) * row_sum_inv[1];
       }
     }
-
     //convert output to fp16
     convert_type_out(mma2rO, mma2rO_half);
-    //copy o from register to share memory
+    //copy O from register to share memory
     copy(r2s_copyO_atom, tOrO_r2s, tOsO_r2s);
+    tma_store_fence();
 
-  }
-  __syncthreads();
-  tma_store_fence();
-  // copy share memory output to global memory
-  if(warp_group_idx == 0 && warp_idx == 0 && lane_predicate) {
-    // wait for all threads to finish writing to shared memory    
+    //all mma threads arrive and proceed 
+    cutlass::arch::NamedBarrier::sync(cutlass::NumThreadsPerWarpGroup,
+                                            cutlass::arch::ReservedNamedBarriers::EpilogueBarrier);
+    //prepare tma load
     int bid = blockIdx.x;
-    int num_tiles = get<2>(prod_shape) / size<0>(sQL);
     int seq_id = bid % num_tiles;
     int head_id = (bid / num_tiles) % get<1>(prod_shape);
     int batch_id = bid / (num_tiles * get<1>(prod_shape));
@@ -462,14 +398,14 @@ __global__ void flash_attention_kernel_arch(const scalar_t* q, const scalar_t* k
     auto gO = local_tile(mO(batch_id, head_id, _, _),
                       make_tile(size<0>(sOL), size<1>(sOL)),
                       make_coord(seq_id, _0{}));               // (bN, head_dim)
-    auto sO = make_tensor(make_smem_ptr<scalar_t>(oShmem), sOL);   // (bN, head_dim)
     auto [tOgO, tOsO] = tma_partition(tmaO, int{0}, Layout<_1>{},
                                     group_modes<0, 2>(sO), group_modes<0, 2>(gO));//(TMA)
+    const int NWarps = blockDim.x / cutlass::NumThreadsPerWarp;
 
-    copy(tmaO, tOsO, tOgO);
-    // tma_store_arrive();}
-
-  // tma_store_wait<0>();
+    // tma copy O share memory  to global memory
+    if(warp_idx == NWarps - 1 && lane_predicate) {
+      copy(tmaO, tOsO, tOgO);
+    }
   }
 
   return;
