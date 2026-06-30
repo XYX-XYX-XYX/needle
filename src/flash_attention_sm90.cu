@@ -118,7 +118,7 @@ template <int Arch, typename GLayoutO, typename Prod_Shape,
           typename SLayoutQ, typename SLayoutK, typename SLayoutV, typename SLayoutO,
           typename MMA1, typename MMA2,
           typename AtomR2SO>
-__global__ __launch_bounds__(256, 2) 
+__global__ __launch_bounds__(384, 1) 
 void flash_attention_kernel_arch(const scalar_t* q, const scalar_t* k, const scalar_t* v,
                                             scalar_t* o, float dropout, bool causal, Prod_Shape prod_shape,
                                             GLayoutO gOL,
@@ -155,7 +155,7 @@ void flash_attention_kernel_arch(const scalar_t* q, const scalar_t* k, const sca
   tma_pipeline_params.transaction_bytes = sizeof(scalar_t) * size<0>(sKL) * size<1>(sKL);
   tma_pipeline_params.role = warp_group_idx == 0 ?  TmaPipeline::ThreadCategory::Producer : TmaPipeline::ThreadCategory::Consumer;
   tma_pipeline_params.is_leader = (lane_predicate && warp_idx == 0);
-  tma_pipeline_params.num_consumers = 128;
+  tma_pipeline_params.num_consumers = 256;
 
   //pipeline for K
   auto *tma_pipeline_k_storage = reinterpret_cast<typename TmaPipeline::SharedStorage *>(smem + smem_offset);
@@ -193,7 +193,7 @@ void flash_attention_kernel_arch(const scalar_t* q, const scalar_t* k, const sca
     //producer 
     cutlass::arch::warpgroup_reg_dealloc<24>();
     int bid = blockIdx.x;
-    int num_tiles = get<2>(prod_shape) / size<0>(sQL);
+    int num_tiles = get<2>(prod_shape) / (size<0>(sQL) * 2);
     int seq_id = bid % num_tiles;
     int head_id = (bid / num_tiles) % get<1>(prod_shape);
     int batch_id = bid / (num_tiles * get<1>(prod_shape));
@@ -202,9 +202,9 @@ void flash_attention_kernel_arch(const scalar_t* q, const scalar_t* k, const sca
     auto mK = tmaK.get_tma_tensor(prod_shape);
     auto mV = tmaV.get_tma_tensor(prod_shape);
 
-    auto gQ = local_tile(mQ(batch_id, head_id, _, _),
-                        make_tile(size<0>(sQL), size<1>(sQL)),
-                        make_coord(seq_id, _0{}));               // (bN, head_dim)
+    auto gQ_cta = local_tile(mQ(batch_id, head_id, _, _),
+                        make_tile(size<0>(sQL) * 2, size<1>(sQL)),
+                        make_coord(seq_id, _0{}));               // (bN * 2, head_dim)
 
     auto gK = local_tile(mK(batch_id, head_id, _, _),
                         make_tile(size<0>(sKL), size<1>(sKL)),
@@ -212,14 +212,16 @@ void flash_attention_kernel_arch(const scalar_t* q, const scalar_t* k, const sca
     auto gV = local_tile(mV(batch_id, head_id, _, _),
                         make_tile(size<0>(sVL), size<1>(sVL)),
                         make_coord(_, _0{})); //(bK, head_dim, k)
-                        
-    auto sQ = make_tensor(make_smem_ptr<scalar_t>(qShmem), sQL);   // (bN, head_dim)
+    
+    auto gQ_div = flat_divide(gQ_cta, make_tile(size<0>(sQL), size<1>(sQL)));   // (bN, head_dim, Nwarps, 1)
+    auto gQ = gQ_div(_, _, _, _0{});   // (bN, head_dim, Nwarps)
+    auto sQ = make_tensor(make_smem_ptr<scalar_t>(qShmem), sQL);   // (bN, head_dim, Nwarps)
     auto sK = make_tensor(make_smem_ptr<scalar_t>(kShmem), sKL);   // (bK, head_dim, kstage)
     auto sV = make_tensor(make_smem_ptr<scalar_t>(vShmem), sVL);   // (bK, head_dim, kstage)
 
     // load global to shared
     auto [tQgQ, tQsQ] = tma_partition(tmaQ, Int<0>{}, Layout<_1>{},
-                                      group_modes<0, 2>(sQ), group_modes<0, 2>(gQ));//(TMA)
+                                      group_modes<0, 2>(sQ), group_modes<0, 2>(gQ));//(TMA, Nwarps)
     auto [tKgK, tKsK] = tma_partition(tmaK, Int<0>{}, Layout<_1>{},
                                       group_modes<0, 2>(sK), group_modes<0, 2>(gK));//(TMA, kstage)
     auto [tVgV, tVsV] = tma_partition(tmaV, Int<0>{}, Layout<_1>{},
@@ -247,17 +249,47 @@ void flash_attention_kernel_arch(const scalar_t* q, const scalar_t* k, const sca
     }
 
   } else {
-    //consumer
+    //consumer 
+    const int consumer_idx = warp_group_idx - 1;
+    constexpr uint32_t kConsumer1Issued = 0;
+    constexpr uint32_t kConsumer2Issued = 1;
+    constexpr int kConsumerThreads = 2 * cutlass::NumThreadsPerWarpGroup; // 256
+    auto pingpong_wait = [&](bool first_gemm_group) {
+      if (consumer_idx == 0) {
+        // Consumer 1 第一轮直接启动；后续等待 Consumer 2
+        if (!first_gemm_group) {
+          cutlass::arch::NamedBarrier::sync(
+              kConsumerThreads, kConsumer2Issued);
+        }
+      } else {
+        // Consumer 2 每轮都等待 Consumer 1
+        cutlass::arch::NamedBarrier::sync(
+            kConsumerThreads, kConsumer1Issued);
+      }
+    };
+
+    auto pingpong_arrive = [&]() {
+      if (consumer_idx == 0) {
+        cutlass::arch::NamedBarrier::arrive(
+            kConsumerThreads, kConsumer1Issued);
+      } else {
+        cutlass::arch::NamedBarrier::arrive(
+            kConsumerThreads, kConsumer2Issued);
+      }
+    };
+
     cutlass::arch::warpgroup_reg_alloc<160>();
     float row_max[2] = {-FLT_MAX, -FLT_MAX};
     float row_sum[2] = {0.0f, 0.0f};
     float scale[2];
-    auto sQ = make_tensor(make_smem_ptr<scalar_t>(qShmem), sQL);   // (bN, head_dim)
+    auto sQ_all = make_tensor(make_smem_ptr<scalar_t>(qShmem), sQL);   // (bN, head_dim, Nwarps)
+    auto sQ = sQ_all(_, _, consumer_idx);   // (bN, head_dim)
     auto sK = make_tensor(make_smem_ptr<scalar_t>(kShmem), sKL);   // (bK, head_dim, kstage)
     auto sV = make_tensor(make_smem_ptr<scalar_t>(vShmem), sVL);   // (bK, head_dim, kstage)
     auto sVt_layout = composition(sVL, make_layout(make_shape(size<1>(sVL), size<0>(sVL), size<2>(sVL)), make_stride(size<0>(sVL), _1{}, size<0>(sVL) * size<1>(sVL))));
     auto sVt = make_tensor(make_smem_ptr<scalar_t>(vShmem), sVt_layout);   // (head_dim, bK, kstage)
-    auto sO = make_tensor(make_smem_ptr<scalar_t>(oShmem), sOL);   // (bN, head_dim)
+    auto sO_all = make_tensor(make_smem_ptr<scalar_t>(oShmem), sOL);   // (bN, head_dim, Nwarps)
+    auto sO = sO_all(_, _, consumer_idx);   // (bN, head_dim)
     auto sP = make_coord_tensor(make_layout(make_shape(size<0>(sQL), size<0>(sKL))));  // (bN, bK)
     // mma1
     auto thr_mma1 = mma1.get_slice(warp_group_thread_idx);
@@ -291,12 +323,16 @@ void flash_attention_kernel_arch(const scalar_t* q, const scalar_t* k, const sca
     //wait for tma for k_0 to finsh
     pipeline_k.consumer_wait(tma_k_read_state);
     
+    bool first_gemm_group = true;
     //gemm 1 for q and k_0
+    pingpong_wait(first_gemm_group);
     clear(mma1rP);
     warpgroup_fence_operand(mma1rP);
     warpgroup_arrive();
     gemm(mma1, mma1rQ, mma1rK(_, _, _, tma_k_read_state.index()), mma1rP);
     warpgroup_commit_batch();
+    pingpong_arrive();
+    first_gemm_group = false;
 
     //wait for gemm1_0 to finish and release k_0
     warpgroup_wait<0>();
@@ -314,6 +350,7 @@ void flash_attention_kernel_arch(const scalar_t* q, const scalar_t* k, const sca
     for(size_t i = 0; i < num_kv_tiles - 1; i++) {
       //wait tma k_i+1 to finish and launch gemm1_i+1
       pipeline_k.consumer_wait(tma_k_read_state);
+      pingpong_wait(first_gemm_group);
       clear(mma1rP);
       warpgroup_fence_operand(mma1rP);
       warpgroup_arrive();
@@ -327,6 +364,7 @@ void flash_attention_kernel_arch(const scalar_t* q, const scalar_t* k, const sca
       warpgroup_arrive();
       gemm(mma2, mma2rP, mma2rV(_, _, _, tma_v_read_state.index()), mma2rO);
       warpgroup_commit_batch();
+      pingpong_arrive();
 
       //wait gemm1_i+1 to finish and release k_i+1
       warpgroup_wait<1>();
@@ -360,11 +398,13 @@ void flash_attention_kernel_arch(const scalar_t* q, const scalar_t* k, const sca
     //num_tiles - 1, only do gemm2
     {
       pipeline_v.consumer_wait(tma_v_read_state);
+      pingpong_wait(first_gemm_group);
       warpgroup_fence_operand(mma2rO);
       warpgroup_fence_operand(mma2rP);
       warpgroup_arrive();
       gemm(mma2, mma2rP, mma2rV(_, _, _, tma_v_read_state.index()), mma2rO);
       warpgroup_commit_batch();       
+      pingpong_arrive();
       warpgroup_wait<0>();
       warpgroup_fence_operand(mma2rO);
       warpgroup_fence_operand(mma2rP);
@@ -388,24 +428,25 @@ void flash_attention_kernel_arch(const scalar_t* q, const scalar_t* k, const sca
     tma_store_fence();
 
     //all mma threads arrive and proceed 
-    cutlass::arch::NamedBarrier::sync(cutlass::NumThreadsPerWarpGroup,
+    cutlass::arch::NamedBarrier::sync(kConsumerThreads,
                                             cutlass::arch::ReservedNamedBarriers::EpilogueBarrier);
     //prepare tma load
     int bid = blockIdx.x;
-    int num_tiles = get<2>(prod_shape) / size<0>(sOL);
+    int num_tiles = get<2>(prod_shape) / (size<0>(sOL) * 2);
     int seq_id = bid % num_tiles;
     int head_id = (bid / num_tiles) % get<1>(prod_shape);
     int batch_id = bid / (num_tiles * get<1>(prod_shape));
     auto mO = tmaO.get_tma_tensor(prod_shape);
-    auto gO = local_tile(mO(batch_id, head_id, _, _),
-                      make_tile(size<0>(sOL), size<1>(sOL)),
-                      make_coord(seq_id, _0{}));               // (bN, head_dim)
+    auto gO_cta = local_tile(mO(batch_id, head_id, _, _),
+                      make_tile(size<0>(sOL) * 2, size<1>(sOL)),
+                      make_coord(seq_id, _0{}));               // (bN * 2, head_dim)
+    auto gO_div = flat_divide(gO_cta, make_tile(size<0>(sOL), size<1>(sOL)));   // (bN, head_dim, Nwarps, 1)
+    auto gO = gO_div(_, _, consumer_idx, _0{});   // (bN, head_dim)
     auto [tOgO, tOsO] = tma_partition(tmaO, int{0}, Layout<_1>{},
                                     group_modes<0, 2>(sO), group_modes<0, 2>(gO));//(TMA)
-    const int NWarps = blockDim.x / cutlass::NumThreadsPerWarp;
 
     // tma copy O share memory  to global memory
-    if(warp_idx == NWarps - 1 && lane_predicate) {
+    if(warp_group_thread_idx == 0) {
       copy(tmaO, tOsO, tOgO);
     }
   }
@@ -453,24 +494,23 @@ void LaunchFlashAttentionForwardForArch(const CudaArray& q, const CudaArray& k, 
   auto bN = Int<64>{};
   auto bK = Int<128>{};
   auto kstage = Int<2>{};
+  auto NWarps = Int<2>{};
 
 
-  auto sQ = tile_to_shape(GMMA::Layout_K_SW128_Atom<scalar_t>{}, make_shape(bN, _64{}));
+  auto sQ = tile_to_shape(GMMA::Layout_K_SW128_Atom<scalar_t>{}, make_shape(bN, _64{}, NWarps));
   auto sK = tile_to_shape(GMMA::Layout_K_SW128_Atom<scalar_t>{}, make_shape(bK, _64{}, kstage));
   auto sV = tile_to_shape(GMMA::Layout_K_SW128_Atom<scalar_t>{}, make_shape(bK, _64{}, kstage));
-  // auto sO = composition(Swizzle<3,3,3>{}, make_layout(make_shape(bN, _64{}), LayoutRight{}));
-  // auto sO_tma = composition(Swizzle<3,4,3>{}, make_layout(make_shape(bN, _64{}), LayoutRight{}));
-  auto sO = tile_to_shape(GMMA::Layout_K_SW128_Atom<scalar_t>{}, make_shape(bN, _64{}));
+  auto sO = tile_to_shape(GMMA::Layout_K_SW128_Atom<scalar_t>{}, make_shape(bN, _64{}, NWarps));
 
   auto mQ = make_tensor(reinterpret_cast<const scalar_t*>(q.ptr), gQ);
   auto mK = make_tensor(reinterpret_cast<const scalar_t*>(k.ptr), gK);
   auto mV = make_tensor(reinterpret_cast<const scalar_t*>(v.ptr), gV);
   auto mO = make_tensor(reinterpret_cast<scalar_t*>(out->ptr), gO);
 
-  Copy_Atom tmaQ = make_tma_atom(SM90_TMA_LOAD{}, mQ, sQ, make_shape(_1{}, _1{}, bN, _64{}));
+  Copy_Atom tmaQ = make_tma_atom(SM90_TMA_LOAD{}, mQ, sQ(_, _, 0), make_shape(_1{}, _1{}, bN, _64{}));
   Copy_Atom tmaK = make_tma_atom(SM90_TMA_LOAD{}, mK, sK(_, _, 0), make_shape(_1{}, _1{}, bK, _64{}));
   Copy_Atom tmaV = make_tma_atom(SM90_TMA_LOAD{}, mV, sV(_, _, 0), make_shape(_1{}, _1{}, bK, _64{}));
-  Copy_Atom tmaO = make_tma_atom(SM90_TMA_STORE{}, mO, sO, make_shape(_1{}, _1{}, bN, _64{}));
+  Copy_Atom tmaO = make_tma_atom(SM90_TMA_STORE{}, mO, sO(_, _, 0), make_shape(_1{}, _1{}, bN, _64{}));
 
 
   auto mma1 = make_tiled_mma(SM90_64x128x16_F32F16F16_SS<GMMA::Major::K, GMMA::Major::K>{});
@@ -484,7 +524,7 @@ constexpr size_t kGmmaSmemAlignment = 128;
 
 size_t smem_bytes = 0;
 smem_bytes = align_up_bytes(smem_bytes, kGmmaSmemAlignment);
-smem_bytes += (bN + bK * kstage + bK * kstage + bN) * head_dim * sizeof(scalar_t); // sQ, sK, sV, sO
+smem_bytes += (bN * NWarps + bK * kstage + bK * kstage + bN * NWarps) * head_dim  * sizeof(scalar_t); // sQ, sK, sV, sO
 smem_bytes += 2 * sizeof(typename cutlass::PipelineTmaAsync<_2{}>::SharedStorage) + 
                 sizeof(typename cutlass::PipelineAsync<_2{}>::SharedStorage) +
                 sizeof(uint64_t); // TMA barriers
@@ -504,11 +544,11 @@ smem_bytes += 2 * sizeof(typename cutlass::PipelineTmaAsync<_2{}>::SharedStorage
   using MMA2_t      = std::decay_t<decltype(mma2)>;
   using AtomR2SO_t = std::decay_t<decltype(r2s_copyO_atom)>;
 
-  dim3 block(256);
+  dim3 block(384);
   // assum q_len % 64 == 0
-  assert(q_len % 64 == 0);
+  assert(q_len % 128 == 0);
   assert(kv_len == q_len);
-  dim3 grid(batch_size * num_heads * q_len / bN);
+  dim3 grid(batch_size * num_heads * q_len / (bN * 2));
 
   using Kernel_t = void (*)(
       const scalar_t*, const scalar_t*, const scalar_t*,
