@@ -5,6 +5,22 @@ import contextlib
 import inspect
 
 
+def get_cudnn_version():
+    """Return the cuDNN runtime version as a readable string and raw integer."""
+    version = torch.backends.cudnn.version()
+    if version is None:
+        return "unavailable", None
+
+    # cuDNN 9 uses M * 10000 + m * 100 + p; older versions use
+    # M * 1000 + m * 100 + p.
+    if version >= 90000:
+        major, remainder = divmod(version, 10000)
+    else:
+        major, remainder = divmod(version, 1000)
+    minor, patch = divmod(remainder, 100)
+    return f"{major}.{minor}.{patch}", version
+
+
 def make_sdpa_context(backend: str):
     """
     backend:
@@ -126,6 +142,7 @@ def benchmark_torch_flash(
         print("CUDA not available. Skipping.")
         return
 
+    backend = backend.lower()
     device = torch.device("cuda")
 
     if dtype_str == "fp16":
@@ -142,6 +159,16 @@ def benchmark_torch_flash(
     v = torch.randn(shape, device=device, dtype=dtype)
 
     torch.cuda.synchronize()
+
+    if backend == "cudnn":
+        cudnn_version, cudnn_version_raw = get_cudnn_version()
+        if cudnn_version_raw is None:
+            print("cuDNN version: unavailable")
+        else:
+            print(
+                f"cuDNN version: {cudnn_version} "
+                f"(torch.backends.cudnn.version()={cudnn_version_raw})"
+            )
 
     print(
         f"Benchmarking PyTorch SDPA: "

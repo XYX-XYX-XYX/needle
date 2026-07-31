@@ -133,7 +133,13 @@ void flash_attention_kernel_arch(const scalar_t* q, const scalar_t* k, const sca
   const int warp_group_idx = cutlass::canonical_warp_group_idx();
   const int warp_group_thread_idx = threadIdx.x % 128;
 
-
+  //prefech for tensormap
+  if(warp_idx == 0 && lane_predicate) {
+    cute::prefetch_tma_descriptor(tmaQ.get_tma_descriptor());
+    cute::prefetch_tma_descriptor(tmaK.get_tma_descriptor());
+    cute::prefetch_tma_descriptor(tmaV.get_tma_descriptor());
+    cute::prefetch_tma_descriptor(tmaO.get_tma_descriptor());
+  }
   // 保证整个动态 shared memory 的起始地址至少 128B 对齐
   extern __shared__ __align__(128) unsigned char smem[];
   size_t smem_offset = 0;
