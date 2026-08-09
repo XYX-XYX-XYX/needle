@@ -3,13 +3,15 @@ CompileFlags:
 
 ---
 If:
-  PathMatch: .*\.cu
+  PathMatch: .*(\.cu|flash_attention_.*\.h)
 CompileFlags:
   Add:
+    - -xcuda
     - -std=c++14
     - -nocudainc
+    - "-D__launch_bounds__(...)="
     - --cuda-path=/usr/local/cuda
-    - --cuda-gpu-arch=sm_90
+    - --cuda-gpu-arch=sm_90a
     - --cuda-host-only
     - --no-cuda-version-check
     - -ferror-limit=0
@@ -66,3 +68,12 @@ Diagnostics:
     - "unused-includes"
     - "typecheck_comparison_of_pointer_integer" # 暂时屏蔽这个 string 比较的警告
     - "-Wstring-compare"                        # 暂时屏蔽这个 string 比较的警告
+
+---
+If:
+  PathMatch: .*flash_attention_.*\.h
+CompileFlags:
+  Add:
+    - -D__host__=
+    - -D__device__=
+    - -D__forceinline__=inline

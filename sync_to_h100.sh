@@ -9,7 +9,7 @@ paths=(
   # "tests"
   # "python"
   "CMakeLists.txt"
-  "project.ipynb"
+  # "project.ipynb"
 )
 
 cd "${ROOT_DIR}"
