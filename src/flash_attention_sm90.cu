@@ -6,6 +6,7 @@
 #include <iostream>
 #include <sstream>
 #include <string>
+#include <cmath>
 
 #include <cutlass/cutlass.h>
 #include <cute/tensor.hpp>
@@ -46,15 +47,15 @@ CUTLASS_DEVICE void convert_type_out(Tensor<Engine, Layout> const &tensor, Tenso
 
 
 template<bool isFirst, typename FragmentP>
-CUTLASS_DEVICE void online_softmax(FragmentP& rP, float dscale, float* row_max, float* row_sum, float* scale) 
+CUTLASS_DEVICE void online_softmax(FragmentP& rP, float softmax_scale_log2, float* row_max, float* row_sum, float* scale) 
 {
   float row_max_new[2] = {row_max[0], row_max[1]};
-
-  //scale rP by head dim scale 
-  #pragma unroll
-  for(size_t i = 0; i < size(rP); i++) {
-    rP(i) = rP(i) * dscale;
-  }
+  float max_scaled[2];
+  // //scale rP by head dim scale 
+  // #pragma unroll
+  // for(size_t i = 0; i < size(rP); i++) {
+  //   rP(i) = rP(i) * dscale;
+  // }
 
   //get local thread row max
   for(size_t i = 0; i < size<0, 2>(rP); i++) {
@@ -70,33 +71,37 @@ CUTLASS_DEVICE void online_softmax(FragmentP& rP, float dscale, float* row_max, 
   row_max_new[1] = fmaxf(row_max_new[1], __shfl_xor_sync(mask, row_max_new[1], 1, 4));
   row_max_new[1] = fmaxf(row_max_new[1], __shfl_xor_sync(mask, row_max_new[1], 2, 4));
 
-
+  max_scaled[0] = row_max_new[0] * softmax_scale_log2;
+  max_scaled[1] = row_max_new[1] * softmax_scale_log2;
   //get local thread sum
   float row_sum_new[2] = {0.0f, 0.0f};
   for(size_t i = 0; i < size<0, 2>(rP); i++) {
     for(size_t j = 0; j < size<0, 0>(rP); j++) {
-      rP(make_coord(j, 0, i), 0, 0) = __expf(rP(make_coord(j, 0, i), 0, 0) - row_max_new[0]);
-      rP(make_coord(j, 1, i), 0, 0) = __expf(rP(make_coord(j, 1, i), 0, 0) - row_max_new[1]);
+      rP(make_coord(j, 0, i), 0, 0) = exp2f(rP(make_coord(j, 0, i), 0, 0) * softmax_scale_log2 - max_scaled[0]);
+      rP(make_coord(j, 1, i), 0, 0) = exp2f(rP(make_coord(j, 1, i), 0, 0) * softmax_scale_log2 - max_scaled[1]);
       row_sum_new[0] += rP(make_coord(j, 0, i), 0, 0);
       row_sum_new[1] += rP(make_coord(j, 1, i), 0, 0);
 
     }
   }
   //shuffle to get the sum of the row
-  row_sum_new[0] += __shfl_xor_sync(mask, row_sum_new[0], 1, 4);
-  row_sum_new[0] += __shfl_xor_sync(mask, row_sum_new[0], 2, 4);
-  row_sum_new[1] += __shfl_xor_sync(mask, row_sum_new[1], 1, 4);
-  row_sum_new[1] += __shfl_xor_sync(mask, row_sum_new[1], 2, 4);
+  // row_sum_new[0] += __shfl_xor_sync(mask, row_sum_new[0], 1, 4);
+  // row_sum_new[0] += __shfl_xor_sync(mask, row_sum_new[0], 2, 4);
+  // row_sum_new[1] += __shfl_xor_sync(mask, row_sum_new[1], 1, 4);
+  // row_sum_new[1] += __shfl_xor_sync(mask, row_sum_new[1], 2, 4);
 
   // float scale[2];
-  scale[0] = __expf(row_max[0] - row_max_new[0]);
-  scale[1] = __expf(row_max[1] - row_max_new[1]);
+
 
   //update row_max and row_sum
-  if(!isFirst) {
+  if constexpr (!isFirst) {
+    scale[0] = exp2f(row_max[0] * softmax_scale_log2 - max_scaled[0]);
+    scale[1] = exp2f(row_max[1] * softmax_scale_log2 - max_scaled[1]);
     row_sum[0] = row_sum_new[0] + row_sum[0] * scale[0];
     row_sum[1] = row_sum_new[1] + row_sum[1] * scale[1];
   } else {
+    scale[0] = 1.0f;
+    scale[1] = 1.0f;
     row_sum[0] = row_sum_new[0];
     row_sum[1] = row_sum_new[1];
   }
@@ -159,7 +164,6 @@ void flash_attention_kernel_arch(const scalar_t* q, const scalar_t* k, const sca
 
   //pipeline for k v
   using TmaPipeline = typename cutlass::PipelineTmaAsync<_2{}>;
-  using GenericPipeline = typename cutlass::PipelineAsync<_2{}>;
   using PipelineState = typename cutlass::PipelineState<_2{}>;
 
   //pipeline for q
@@ -198,13 +202,6 @@ void flash_attention_kernel_arch(const scalar_t* q, const scalar_t* k, const sca
   TmaPipeline_Q pipeline_q(*tma_pipeline_q_storage, tma_pipeline_params_q, Shape<_1, _1, _1>{});
   PipelineState_Q tma_q_write_state = cutlass::make_producer_start_state<TmaPipeline_Q>();
   PipelineState_Q tma_q_read_state;
-  // //barrier for q
-  // constexpr int tma_transaction_q_bytes = sizeof(scalar_t) * size(sQL);
-  // using BarType = cutlass::arch::ClusterTransactionBarrier;
-  // uint64_t* tma_barrier_q = reinterpret_cast<uint64_t*>(smem + smem_offset);
-  // if(lane_predicate && warp_group_idx == 0 && warp_idx == 0) {
-  //   BarType::init(tma_barrier_q, 1);
-  // }
   __syncthreads();
 
   if(thread0()) {
@@ -253,12 +250,16 @@ void flash_attention_kernel_arch(const scalar_t* q, const scalar_t* k, const sca
                                         group_modes<0, 2>(sK), group_modes<0, 2>(gK));//(TMA, kstage)
       auto [tVgV, tVsV] = tma_partition(tmaV, Int<0>{}, Layout<_1>{},
                                         group_modes<0, 2>(sV), group_modes<0, 2>(gV));//(TMA, kstage)
-      if(lane_predicate && warp_idx == 0) {
-        // global q to share q
-        pipeline_q.producer_acquire(tma_q_write_state);
-        auto tma_barrier_q = pipeline_q.producer_get_barrier(tma_q_write_state);
-        copy(tmaQ.with(*tma_barrier_q), tQgQ, tQsQ);
-        ++tma_q_write_state;
+      if(warp_idx == 0) {
+        if(lane_predicate) {
+          // global q to share q
+          pipeline_q.producer_acquire(tma_q_write_state);
+          auto tma_barrier_q = pipeline_q.producer_get_barrier(tma_q_write_state);
+          copy(tmaQ.with(*tma_barrier_q), tQgQ, tQsQ);
+          ++tma_q_write_state;
+        }
+      } else {
+        return ;
       }
       
       int num_kv_tiles = get<2>(prod_shape) / size<0>(sKL);
@@ -343,7 +344,7 @@ void flash_attention_kernel_arch(const scalar_t* q, const scalar_t* k, const sca
     //tma store gO 
     auto mO = tmaO.get_tma_tensor(prod_shape);
 
-    float d_scale = rsqrtf(float(get<3>(prod_shape)));
+    float softmax_scale_log2 = rsqrtf(float(get<3>(prod_shape))) * M_LOG2E;
     for(auto work_tile = tile_scheduler.get_initial_work(); work_tile.is_valid(); work_tile = tile_scheduler.get_next_work(work_tile)) {
       int batch_id = work_tile.batch_id();
       int head_id = work_tile.head_id();
@@ -359,7 +360,7 @@ void flash_attention_kernel_arch(const scalar_t* q, const scalar_t* k, const sca
       //process
       float row_max[2] = {-FLT_MAX, -FLT_MAX};
       float row_sum[2] = {0.0f, 0.0f};
-      float scale[2];
+      float scale[2] = {1.0f, 1.0f};
       clear(mma2rO);
       //wait for tma for Q to finish
       pipeline_q.consumer_wait(tma_q_read_state);
@@ -380,7 +381,7 @@ void flash_attention_kernel_arch(const scalar_t* q, const scalar_t* k, const sca
       warpgroup_fence_operand(mma1rP);
       pipeline_k.consumer_release(tma_k_read_state);
       ++tma_k_read_state;
-      online_softmax<true>(mma1rP, d_scale, row_max, row_sum, scale);
+      online_softmax<true>(mma1rP, softmax_scale_log2, row_max, row_sum, scale);
       //mma1rP to mma2rP
       convert_type_out(mma1rP_mma2_view, mma2rP);
           int num_kv_tiles = get<2>(prod_shape) / size<0>(sKL);
@@ -410,7 +411,7 @@ void flash_attention_kernel_arch(const scalar_t* q, const scalar_t* k, const sca
         ++tma_k_read_state;
 
         //online softmax for mma1rP_i+1
-        online_softmax<false>(mma1rP, d_scale, row_max, row_sum, scale);
+        online_softmax<false>(mma1rP, softmax_scale_log2, row_max, row_sum, scale);
         
         //wait gemm2_i to finish and release v_i
         warpgroup_wait<0>();
@@ -430,7 +431,8 @@ void flash_attention_kernel_arch(const scalar_t* q, const scalar_t* k, const sca
         //mma1rP_i+1 to mma2rP_i+1
         convert_type_out(mma1rP_mma2_view, mma2rP);
       }
-
+      pipeline_q.consumer_release(tma_q_read_state);
+      ++tma_q_read_state;
       //num_tiles - 1, only do gemm2
       {
         pipeline_v.consumer_wait(tma_v_read_state);
@@ -444,14 +446,19 @@ void flash_attention_kernel_arch(const scalar_t* q, const scalar_t* k, const sca
         warpgroup_wait<0>();
         warpgroup_fence_operand(mma2rO);
         warpgroup_fence_operand(mma2rP);
-        pipeline_q.consumer_release(tma_q_read_state);
-        ++tma_q_read_state;
+
         pipeline_v.consumer_release(tma_v_read_state);
         ++tma_v_read_state;
       }
 
       //epilogue
       //finalize scaling output by row_sum
+      //shuffle to get the sum of the row
+      constexpr unsigned mask = 0xffffffffu;
+      row_sum[0] += __shfl_xor_sync(mask, row_sum[0], 1, 4);
+      row_sum[0] += __shfl_xor_sync(mask, row_sum[0], 2, 4);
+      row_sum[1] += __shfl_xor_sync(mask, row_sum[1], 1, 4);
+      row_sum[1] += __shfl_xor_sync(mask, row_sum[1], 2, 4);
       float row_sum_inv[2];
       row_sum_inv[0] = 1.0f / row_sum[0];
       row_sum_inv[1] = 1.0f / row_sum[1];
@@ -556,7 +563,6 @@ size_t smem_bytes = 0;
 smem_bytes = align_up_bytes(smem_bytes, kGmmaSmemAlignment);
 smem_bytes += (bN * NWarps + bK * kstage + bK * kstage + bN * NWarps) * head_dim  * sizeof(scalar_t); // sQ, sK, sV, sO
 smem_bytes += 2 * sizeof(typename cutlass::PipelineTmaAsync<_2{}>::SharedStorage) + 
-                sizeof(typename cutlass::PipelineAsync<_2{}>::SharedStorage) + 
                 sizeof(typename cutlass::PipelineTmaAsync<_1{}>::SharedStorage); // pipeline for k, v, q
 
 

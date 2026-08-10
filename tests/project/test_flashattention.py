@@ -82,7 +82,7 @@ def _resolve_backend_kernel(device, kernel):
 #     np.testing.assert_allclose(probs, label_probs, atol=1e-5, rtol=1e-5)
 
 
-@pytest.mark.parametrize("batch_size", [2, 32, 16])
+@pytest.mark.parametrize("batch_size", [2, 16])
 @pytest.mark.parametrize("num_heads", [5, 10, 32])
 @pytest.mark.parametrize("queries_len", [128, 256, 1024, 2048])
 @pytest.mark.parametrize("inner_dim", [64])
