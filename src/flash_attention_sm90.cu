@@ -144,7 +144,9 @@ void flash_attention_kernel_arch(const scalar_t* q, const scalar_t* k, const sca
   const int warp_group_thread_idx = threadIdx.x % 128;
 
   constexpr int NConsumerWarpGroups = 3;
-  constexpr int KStage = 5;
+  constexpr int KStage = decltype(size<2>(sKL))::value;
+  constexpr int QStage = decltype(size<3>(sQL))::value;
+  static_assert(QStage == 2, "The SM90 Q pipeline expects double-buffered shared memory");
 
   //prefech for tensormap
   if(warp_idx == 0 && lane_predicate) {
@@ -170,10 +172,10 @@ void flash_attention_kernel_arch(const scalar_t* q, const scalar_t* k, const sca
   using PipelineState = typename cutlass::PipelineState<KStage>;
 
   //pipeline for q
-  using TmaPipeline_Q = typename cutlass::PipelineTmaAsync<_1{}>;
-  using PipelineState_Q = typename cutlass::PipelineState<_1{}>;
+  using TmaPipeline_Q = typename cutlass::PipelineTmaAsync<QStage>;
+  using PipelineState_Q = typename cutlass::PipelineState<QStage>;
 
-  TmaPipeline::Params tma_pipeline_params;
+  typename TmaPipeline::Params tma_pipeline_params;
   tma_pipeline_params.transaction_bytes = sizeof(scalar_t) * size<0>(sKL) * size<1>(sKL);
   tma_pipeline_params.role = warp_group_idx == 0 ?  TmaPipeline::ThreadCategory::Producer : TmaPipeline::ThreadCategory::Consumer;
   tma_pipeline_params.is_leader = (lane_predicate && warp_idx == 0);
@@ -193,8 +195,10 @@ void flash_attention_kernel_arch(const scalar_t* q, const scalar_t* k, const sca
   PipelineState tma_v_write_state = cutlass::make_producer_start_state<TmaPipeline>();
   PipelineState tma_v_read_state;
   
-  TmaPipeline_Q::Params tma_pipeline_params_q;
-  tma_pipeline_params_q.transaction_bytes = sizeof(scalar_t) * size(sQL);
+  typename TmaPipeline_Q::Params tma_pipeline_params_q;
+  // A Q transaction fills one pipeline stage, not both stages in sQL.
+  tma_pipeline_params_q.transaction_bytes =
+      sizeof(scalar_t) * size<0>(sQL) * size<1>(sQL) * size<2>(sQL);
   tma_pipeline_params_q.role = warp_group_idx == 0 ?  TmaPipeline_Q::ThreadCategory::Producer : TmaPipeline_Q::ThreadCategory::Consumer;
   tma_pipeline_params_q.is_leader = (lane_predicate && warp_idx == 0);
   tma_pipeline_params_q.num_consumers = NConsumerWarpGroups * cutlass::NumThreadsPerWarpGroup;
@@ -223,7 +227,7 @@ void flash_attention_kernel_arch(const scalar_t* q, const scalar_t* k, const sca
     auto mQ = tmaQ.get_tma_tensor(prod_shape);
     auto mK = tmaK.get_tma_tensor(prod_shape);
     auto mV = tmaV.get_tma_tensor(prod_shape);
-    auto sQ = make_tensor(make_smem_ptr<scalar_t>(qShmem), sQL);   // (bN, head_dim, NWarpGroups)
+    auto sQ = make_tensor(make_smem_ptr<scalar_t>(qShmem), sQL);   // (bN, head_dim, NWarpGroups, qstage)
     auto sK = make_tensor(make_smem_ptr<scalar_t>(kShmem), sKL);   // (bK, head_dim, kstage)
     auto sV = make_tensor(make_smem_ptr<scalar_t>(vShmem), sVL);   // (bK, head_dim, kstage)
 
@@ -258,7 +262,8 @@ void flash_attention_kernel_arch(const scalar_t* q, const scalar_t* k, const sca
           // global q to share q
           pipeline_q.producer_acquire(tma_q_write_state);
           auto tma_barrier_q = pipeline_q.producer_get_barrier(tma_q_write_state);
-          copy(tmaQ.with(*tma_barrier_q), tQgQ, tQsQ);
+          copy(tmaQ.with(*tma_barrier_q), tQgQ,
+               tQsQ(_, _, tma_q_write_state.index()));
           ++tma_q_write_state;
         }
       } else {
@@ -321,8 +326,7 @@ void flash_attention_kernel_arch(const scalar_t* q, const scalar_t* k, const sca
     };
     bool first_gemm_group = true;
     
-    auto sQ_all = make_tensor(make_smem_ptr<scalar_t>(qShmem), sQL);   // (bN, head_dim, NWarpGroups)
-    auto sQ = sQ_all(_, _, consumer_idx);   // (bN, head_dim)
+    auto sQ_all = make_tensor(make_smem_ptr<scalar_t>(qShmem), sQL);   // (bN, head_dim, NWarpGroups, qstage)
     auto sK = make_tensor(make_smem_ptr<scalar_t>(kShmem), sKL);   // (bK, head_dim, kstage)
     auto sV = make_tensor(make_smem_ptr<scalar_t>(vShmem), sVL);   // (bK, head_dim, kstage)
     auto sVt_layout = composition(sVL, make_layout(make_shape(size<1>(sVL), size<0>(sVL), size<2>(sVL)), make_stride(size<0>(sVL), _1{}, size<0>(sVL) * size<1>(sVL))));
@@ -332,10 +336,8 @@ void flash_attention_kernel_arch(const scalar_t* q, const scalar_t* k, const sca
     auto sP = make_coord_tensor(make_layout(make_shape(size<0>(sQL), size<0>(sKL))));  // (bN, bK)
     // mma1
     auto thr_mma1 = mma1.get_slice(warp_group_thread_idx);
-    auto mma1sQ = thr_mma1.partition_A(sQ);   // (MMA, Mma_M, Mma_K)
     auto mma1sK = thr_mma1.partition_B(sK);    // (MMA, Mma_N, Mma_K, kstage)
     auto mma1sP = thr_mma1.partition_C(sP);   // (MMA, Mma_M, Mma_N)
-    auto mma1rQ = thr_mma1.make_fragment_A(mma1sQ);   // (MMA, Mma_M, Mma_K)
     auto mma1rK = thr_mma1.make_fragment_B(mma1sK);   // (MMA, Mma_N, Mma_K, kstage)
     auto mma1rP = thr_mma1.make_fragment_C(mma1sP);   // (MMA, Mma_M, Mma_N)
     // mma2 
@@ -376,6 +378,9 @@ void flash_attention_kernel_arch(const scalar_t* q, const scalar_t* k, const sca
       clear(mma2rO);
       //wait for tma for Q to finish
       pipeline_q.consumer_wait(tma_q_read_state);
+      auto sQ = sQ_all(_, _, consumer_idx, tma_q_read_state.index());   // (bN, head_dim)
+      auto mma1sQ = thr_mma1.partition_A(sQ);   // (MMA, Mma_M, Mma_K)
+      auto mma1rQ = thr_mma1.make_fragment_A(mma1sQ);   // (MMA, Mma_M, Mma_K)
 
       //wait for tma for k_0 to finsh
       pipeline_k.consumer_wait(tma_k_read_state);
@@ -542,11 +547,12 @@ void LaunchFlashAttentionForwardForArch(const CudaArray& q, const CudaArray& k, 
 
   auto bN = Int<64>{};
   auto bK = Int<128>{};
-  auto kstage = Int<5>{};
+  auto kstage = Int<4>{};
+  auto qstage = Int<2>{};
   auto NWarpGroups = Int<3>{};
 
 
-  auto sQ = tile_to_shape(GMMA::Layout_K_SW128_Atom<scalar_t>{}, make_shape(bN, _64{}, NWarpGroups));
+  auto sQ = tile_to_shape(GMMA::Layout_K_SW128_Atom<scalar_t>{}, make_shape(bN, _64{}, NWarpGroups, qstage));
   auto sK = tile_to_shape(GMMA::Layout_K_SW128_Atom<scalar_t>{}, make_shape(bK, _64{}, kstage));
   auto sV = tile_to_shape(GMMA::Layout_K_SW128_Atom<scalar_t>{}, make_shape(bK, _64{}, kstage));
   auto sO = tile_to_shape(GMMA::Layout_K_SW128_Atom<scalar_t>{}, make_shape(bN, _64{}, NWarpGroups));
@@ -556,7 +562,7 @@ void LaunchFlashAttentionForwardForArch(const CudaArray& q, const CudaArray& k, 
   auto mV = make_tensor(reinterpret_cast<const scalar_t*>(v.ptr), gV);
   auto mO = make_tensor(reinterpret_cast<scalar_t*>(out->ptr), gO);
 
-  Copy_Atom tmaQ = make_tma_atom(SM90_TMA_LOAD{}, mQ, sQ(_, _, 0), make_shape(_1{}, _1{}, bN, _64{}));
+  Copy_Atom tmaQ = make_tma_atom(SM90_TMA_LOAD{}, mQ, sQ(_, _, 0, 0), make_shape(_1{}, _1{}, bN, _64{}));
   Copy_Atom tmaK = make_tma_atom(SM90_TMA_LOAD{}, mK, sK(_, _, 0), make_shape(_1{}, _1{}, bK, _64{}));
   Copy_Atom tmaV = make_tma_atom(SM90_TMA_LOAD{}, mV, sV(_, _, 0), make_shape(_1{}, _1{}, bK, _64{}));
   Copy_Atom tmaO = make_tma_atom(SM90_TMA_STORE{}, mO, sO(_, _, 0), make_shape(_1{}, _1{}, bN, _64{}));
@@ -573,9 +579,9 @@ constexpr size_t kGmmaSmemAlignment = 128;
 
 size_t smem_bytes = 0;
 smem_bytes = align_up_bytes(smem_bytes, kGmmaSmemAlignment);
-smem_bytes += (bN * NWarpGroups + bK * kstage + bK * kstage + bN * NWarpGroups) * head_dim  * sizeof(scalar_t); // sQ, sK, sV, sO
+smem_bytes += (bN * NWarpGroups * qstage + bK * kstage + bK * kstage + bN * NWarpGroups) * head_dim  * sizeof(scalar_t); // sQ, sK, sV, sO
 smem_bytes += 2 * sizeof(typename cutlass::PipelineTmaAsync<kstage>::SharedStorage) + 
-                sizeof(typename cutlass::PipelineTmaAsync<_1{}>::SharedStorage); // pipeline for k, v, q
+                sizeof(typename cutlass::PipelineTmaAsync<qstage>::SharedStorage); // pipeline for k, v, q
 
 
   using Prod_Shape_t = decltype(prod_shape);
