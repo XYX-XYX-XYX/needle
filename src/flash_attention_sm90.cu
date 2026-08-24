@@ -144,6 +144,7 @@ void flash_attention_kernel_arch(const scalar_t* q, const scalar_t* k, const sca
   const int warp_group_thread_idx = threadIdx.x % 128;
 
   constexpr int NConsumerWarpGroups = 3;
+  constexpr int KStage = 5;
 
   //prefech for tensormap
   if(warp_idx == 0 && lane_predicate) {
@@ -165,8 +166,8 @@ void flash_attention_kernel_arch(const scalar_t* q, const scalar_t* k, const sca
   smem_offset += static_cast<size_t>(cosize(sOL)) * sizeof(scalar_t);
 
   //pipeline for k v
-  using TmaPipeline = typename cutlass::PipelineTmaAsync<_2{}>;
-  using PipelineState = typename cutlass::PipelineState<_2{}>;
+  using TmaPipeline = typename cutlass::PipelineTmaAsync<KStage>;
+  using PipelineState = typename cutlass::PipelineState<KStage>;
 
   //pipeline for q
   using TmaPipeline_Q = typename cutlass::PipelineTmaAsync<_1{}>;
@@ -541,7 +542,7 @@ void LaunchFlashAttentionForwardForArch(const CudaArray& q, const CudaArray& k, 
 
   auto bN = Int<64>{};
   auto bK = Int<128>{};
-  auto kstage = Int<2>{};
+  auto kstage = Int<5>{};
   auto NWarpGroups = Int<3>{};
 
 
@@ -573,7 +574,7 @@ constexpr size_t kGmmaSmemAlignment = 128;
 size_t smem_bytes = 0;
 smem_bytes = align_up_bytes(smem_bytes, kGmmaSmemAlignment);
 smem_bytes += (bN * NWarpGroups + bK * kstage + bK * kstage + bN * NWarpGroups) * head_dim  * sizeof(scalar_t); // sQ, sK, sV, sO
-smem_bytes += 2 * sizeof(typename cutlass::PipelineTmaAsync<_2{}>::SharedStorage) + 
+smem_bytes += 2 * sizeof(typename cutlass::PipelineTmaAsync<kstage>::SharedStorage) + 
                 sizeof(typename cutlass::PipelineTmaAsync<_1{}>::SharedStorage); // pipeline for k, v, q
 
 
