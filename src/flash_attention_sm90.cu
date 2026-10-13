@@ -124,7 +124,9 @@ template <int Arch, typename TileScheduler, typename GLayoutO, typename Prod_Sha
           typename SLayoutQ, typename SLayoutK, typename SLayoutV, typename SLayoutO,
           typename MMA1, typename MMA2,
           typename AtomR2SO>
-__global__ __launch_bounds__(512, 1) 
+__global__ 
+// __block_size__(512, 1)
+__launch_bounds__(512, 1) 
 void flash_attention_kernel_arch(const scalar_t* q, const scalar_t* k, const scalar_t* v,
                                             scalar_t* o, float dropout, bool causal, Prod_Shape prod_shape,
                                             GLayoutO gOL,
@@ -403,41 +405,34 @@ void flash_attention_kernel_arch(const scalar_t* q, const scalar_t* k, const sca
       convert_type_out(mma1rP_mma2_view, mma2rP);
       int num_kv_tiles = get<2>(prod_shape) / size<0>(sKL);
       for(size_t i = 0; i < num_kv_tiles - 1; i++) {
-        //wait tma k_i+1 to finish and launch gemm1_i+1
-        pipeline_k.consumer_wait(tma_k_read_state);
+        pipeline_v.consumer_wait(tma_v_read_state);
         pingpong_wait(first_gemm_group);
+        warpgroup_fence_operand(mma2rO);
+        warpgroup_fence_operand(mma2rP);
+        warpgroup_arrive();
+        gemm(mma2, mma2rP, mma2rV(_, _, _, tma_v_read_state.index()), mma2rO);
+        warpgroup_commit_batch();
+
+        pipeline_k.consumer_wait(tma_k_read_state);
         clear(mma1rP);
         warpgroup_fence_operand(mma1rP);
         warpgroup_arrive();
         gemm(mma1, mma1rQ, mma1rK(_, _, _, tma_k_read_state.index()), mma1rP);
         warpgroup_commit_batch();
 
-        //wait tma v_i to finish and launch gemm2_i which consumes mma2rP_i and produces mma2rO_i
-        pipeline_v.consumer_wait(tma_v_read_state);
-        warpgroup_fence_operand(mma2rO);
-        warpgroup_fence_operand(mma2rP);
-        warpgroup_arrive();
-        gemm(mma2, mma2rP, mma2rV(_, _, _, tma_v_read_state.index()), mma2rO);
-        warpgroup_commit_batch();
         pingpong_arrive();
 
-        //wait gemm1_i+1 to finish and release k_i+1
-        warpgroup_wait<1>();
-        warpgroup_fence_operand(mma1rP);
-        pipeline_k.consumer_release(tma_k_read_state);
-        ++tma_k_read_state;
-
-        //online softmax for mma1rP_i+1
-        online_softmax<false>(mma1rP, softmax_scale_log2, row_max, row_sum, scale);
-        
-        //wait gemm2_i to finish and release v_i
         warpgroup_wait<0>();
         warpgroup_fence_operand(mma2rO);
         warpgroup_fence_operand(mma2rP);
+        warpgroup_fence_operand(mma1rP);
         pipeline_v.consumer_release(tma_v_read_state);
         ++tma_v_read_state;
+        pipeline_k.consumer_release(tma_k_read_state);
+        ++tma_k_read_state;
 
-        //scale rO_i and prepare for the next gemm2
+        online_softmax<false>(mma1rP, softmax_scale_log2, row_max, row_sum, scale);
+        convert_type_out(mma1rP_mma2_view, mma2rP);
         #pragma unroll
         for(size_t j = 0; j < size<0, 2>(mma2rO); j++) {
           for(size_t k = 0; k < size<0, 0>(mma2rO); k++) {
@@ -445,12 +440,9 @@ void flash_attention_kernel_arch(const scalar_t* q, const scalar_t* k, const sca
             mma2rO(make_coord(k, 1, j), 0, 0) = mma2rO(make_coord(k, 1, j), 0, 0) * scale[1];
           }
         }
-        //mma1rP_i+1 to mma2rP_i+1
-        convert_type_out(mma1rP_mma2_view, mma2rP);
       }
       pipeline_q.consumer_release(tma_q_read_state);
       ++tma_q_read_state;
-      //num_tiles - 1, only do gemm2
       {
         pipeline_v.consumer_wait(tma_v_read_state);
         pingpong_wait(first_gemm_group);
@@ -467,6 +459,7 @@ void flash_attention_kernel_arch(const scalar_t* q, const scalar_t* k, const sca
         pipeline_v.consumer_release(tma_v_read_state);
         ++tma_v_read_state;
       }
+
 
       //epilogue
       //finalize scaling output by row_sum
